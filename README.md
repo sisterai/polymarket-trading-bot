@@ -74,6 +74,9 @@ npm run redeem:holdings
 
 # Redeem by condition ID
 npm run redeem
+
+npm run redeem:auto -- --api --full --pools-within-hours 6 --no-redeemable-filter
+
 ```
 
 **Development**

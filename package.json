@@ -7,6 +7,7 @@
     "redeem": "ts-node src/redeem.ts",
     "redeem:holdings": "ts-node src/redeem-holdings.ts",
     "redeem:proxy": "ts-node src/redeem-proxy.ts",
+    "redeem:auto": "ts-node src/redeem/auto-redeem.ts",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [
