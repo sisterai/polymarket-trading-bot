@@ -412,32 +412,27 @@ export class UpDownPredictionBot {
                 roundStartTime: current5mSlotStartMs(),
             };
 
-            // Get prediction for UP token - ONLY returns prediction at pole values, null otherwise
+            // Returns a prediction when a trigger fires (pole, momentum, or expiry regime)
             const prediction = predictor.updateAndPredictWithSnapshot(snapshot);
 
-            // Only process if we have a prediction (at pole value)
             if (!prediction) {
-                // No prediction - price change too small or not at pole, skip
                 row.previousUpPrice = upAsk;
                 return;
             }
 
-            // Track prediction for accuracy calculation
+            // Track prediction for accuracy calculation.
+            // Direction is determined by sign of price change; a zero move
+            // is treated as "up" (tie-breaking toward the previous prediction
+            // is not meaningful either way for a 0-move outcome).
             const lastPred = this.lastPredictions.get(market);
             if (lastPred) {
-                // Calculate if previous prediction was correct
-                // Actual direction - use 0.02 threshold (same as noise threshold)
                 const priceDiff = upAsk - lastPred.actualPrice;
-                // Only consider significant changes (>= 0.02) for direction evaluation
-                const actualDirection = Math.abs(priceDiff) >= 0.02
-                    ? (priceDiff > 0 ? "up" : "down")
-                    : (priceDiff >= 0 ? "up" : "down"); // If change < 0.02, use trend (neutral+up → up)
+                const actualDirection: "up" | "down" = priceDiff >= 0 ? "up" : "down";
                 const wasCorrect = lastPred.prediction.direction === actualDirection;
                 const timeDiff = Date.now() - lastPred.timestamp;
 
                 logger.info(`🔮 Prediction: ${lastPred.prediction.direction.toUpperCase()} (conf: ${lastPred.prediction.confidence.toFixed(2)}) | Actual: ${actualDirection.toUpperCase()} | ${wasCorrect ? "✅ CORRECT" : "❌ WRONG"} | Time: ${timeDiff}ms`);
 
-                // Update prediction score with previous prediction result
                 this.updatePredictionScore(market, slug, lastPred.prediction, lastPred.actualPrice, upAsk, wasCorrect);
             }
 
@@ -448,9 +443,9 @@ export class UpDownPredictionBot {
                 timestamp: Date.now(),
             });
 
-            // Log prediction details (only at pole values)
             const bestEdge = Math.max(prediction.edgeBuyUp, prediction.edgeBuyDown);
-            logger.info(`🔮 PREDICT [POLE]: pUp=${prediction.pUp.toFixed(3)} | Edge=${(bestEdge * 100).toFixed(1)}% | Dir: ${prediction.direction.toUpperCase()} | Signal: ${prediction.signal} | Pred: ${prediction.predictedPrice.toFixed(4)} (cur: ${upAsk.toFixed(4)}) | Mom: ${prediction.features.momentum.toFixed(3)} | Vol: ${prediction.features.volatility.toFixed(3)} | Trend: ${prediction.features.trend.toFixed(3)}`);
+            const triggerType = prediction.isPoleValue ? "POLE" : prediction.regime.toUpperCase();
+            logger.info(`🔮 PREDICT [${triggerType}]: regime=${prediction.regime} | pUp=${prediction.pUp.toFixed(3)} | Edge=${(bestEdge * 100).toFixed(1)}% | Dir: ${prediction.direction.toUpperCase()} | Signal: ${prediction.signal} | Pred: ${prediction.predictedPrice.toFixed(4)} (cur: ${upAsk.toFixed(4)}) | Mom: ${prediction.features.momentum.toFixed(3)} | Vol: ${prediction.features.volatility.toFixed(3)} | Trend: ${prediction.features.trend.toFixed(3)}`);
 
             // Execute prediction-based trading strategy
             this.executePredictionTrade(market, slug, prediction, upAsk, downAsk, currentTokenIds);
@@ -997,9 +992,8 @@ export class UpDownPredictionBot {
         const now = new Date();
         const minutes = now.getMinutes();
 
-        // Only generate summaries at 5-minute boundaries
         if (minutes % 5 !== 0) {
-            return; // Not at a quarter-hour boundary, skip
+            return;
         }
 
         // Generate summary for each active market/slug

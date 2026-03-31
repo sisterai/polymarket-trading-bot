@@ -1,4 +1,4 @@
-import type { PricePrediction, MarketSnapshot } from "./pricePredictor";
+import type { PricePrediction, MarketSnapshot, MarketRegime } from "./pricePredictor";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Record Types
@@ -33,6 +33,9 @@ export interface PredictionRecord {
 
     // Smoothed price at prediction time (baseline for direction evaluation)
     basePrice: number;
+
+    // Market regime at prediction time
+    regime: MarketRegime;
 }
 
 export interface ResolvedRecord extends PredictionRecord {
@@ -126,6 +129,7 @@ export class PredictionDiagnostics {
             volatility: prediction.features.volatility,
             trend: prediction.features.trend,
             basePrice,
+            regime: prediction.regime,
         };
 
         this.pending = rec;
@@ -253,13 +257,13 @@ export class PredictionDiagnostics {
         const warnings: string[] = [];
         let tradingAllowed = true;
 
-        // Single-pass scan over the tail of the resolved buffer.
-        // Computes all health metrics at once instead of multiple slice+filter passes.
+        // Single-pass scan over the full resolved buffer.
+        // Drawdown and losing streak need the full history.
+        // Health accuracy and spread anomaly only need the tail windows.
         const buf = this.resolved;
         const n = buf.length;
         const healthStart = Math.max(0, n - PredictionDiagnostics.HEALTH_WINDOW);
         const spreadStart = Math.max(0, n - PredictionDiagnostics.SPREAD_ANOMALY_WINDOW);
-        const scanStart = Math.min(healthStart, spreadStart);
 
         let healthCorrect = 0;
         let healthCount = 0;
@@ -269,10 +273,12 @@ export class PredictionDiagnostics {
         let rollingPnl = 0;
         let peakPnl = 0;
         let maxDrawdown = 0;
-        let losingStreak = 0;
-        let maxLosingStreak = 0;
+        // Current streak at the END of the buffer (not historical max).
+        // A streak of 5 losses that happened 100 predictions ago and was
+        // followed by 50 wins should NOT disable trading now.
+        let currentLosingStreak = 0;
 
-        for (let i = scanStart; i < n; i++) {
+        for (let i = 0; i < n; i++) {
             const r = buf[i];
 
             if (i >= healthStart) {
@@ -293,13 +299,13 @@ export class PredictionDiagnostics {
                 maxDrawdown = Math.min(maxDrawdown, rollingPnl - peakPnl);
             }
 
-            // Losing streak (for traded signals only)
+            // Current losing streak: only the streak at the tail matters.
+            // Resets on any correct trade or HOLD (HOLD breaks streaks).
             if (r.signal !== "HOLD") {
                 if (!r.wasCorrect) {
-                    losingStreak++;
-                    maxLosingStreak = Math.max(maxLosingStreak, losingStreak);
+                    currentLosingStreak++;
                 } else {
-                    losingStreak = 0;
+                    currentLosingStreak = 0;
                 }
             }
         }
@@ -337,9 +343,12 @@ export class PredictionDiagnostics {
             warnings.push(`drawdown limit hit: ${(maxDrawdown * 100).toFixed(1)}% (threshold: ${(PredictionDiagnostics.MAX_DRAWDOWN_THRESHOLD * 100).toFixed(0)}%)`);
         }
 
-        // Losing streak warning
-        if (maxLosingStreak >= PredictionDiagnostics.LOSING_STREAK_LIMIT) {
-            warnings.push(`${maxLosingStreak} consecutive losing trades`);
+        // Losing streak: disable trading after N consecutive losses (cooldown).
+        // Uses the CURRENT streak (at the tail of the buffer), not the worst-ever
+        // historical streak, so recovery from a past streak doesn't remain sticky.
+        if (currentLosingStreak >= PredictionDiagnostics.LOSING_STREAK_LIMIT) {
+            tradingAllowed = false;
+            warnings.push(`losing streak cooldown: ${currentLosingStreak} consecutive losing trades`);
         }
 
         return { tradingAllowed, warnings, recentAccuracy, spreadAnomaly, overconfident, rollingPnl, maxDrawdown };
@@ -360,6 +369,7 @@ export class PredictionDiagnostics {
             `Hit rate: ${(s.hitRate * 100).toFixed(1)}% | Trade hit rate: ${(s.tradeHitRate * 100).toFixed(1)}%`,
             `Traded: ${s.tradedCount} | Hold: ${s.holdCount} | No-trade rate: ${(s.noTradeRate * 100).toFixed(0)}%`,
             `BUY_UP: ${s.buyUpCount} (${(s.buyUpHitRate * 100).toFixed(0)}%) | BUY_DOWN: ${s.buyDownCount} (${(s.buyDownHitRate * 100).toFixed(0)}%)`,
+            `Regimes: ${this.formatRegimeCounts()}`,
             `Avg edge before cost: ${(s.avgEdgeBeforeCost * 100).toFixed(2)}% | after cost: ${(s.avgEdgeAfterCost * 100).toFixed(2)}%`,
             `Rolling PnL: ${(h.rollingPnl * 100).toFixed(2)}% | Max drawdown: ${(h.maxDrawdown * 100).toFixed(2)}%`,
             `Calibration: ${s.calibrationBuckets.map(b => `[${b.rangeLabel}] n=${b.count} hit=${(b.hitRate * 100).toFixed(0)}%`).join(" | ")}`,
@@ -376,6 +386,14 @@ export class PredictionDiagnostics {
     }
 
     // ── Helpers ────────────────────────────────────────────────────────
+
+    private formatRegimeCounts(): string {
+        const counts: Record<string, number> = { momentum: 0, reversal: 0, chop: 0, expiry: 0 };
+        for (const r of this.resolved) {
+            counts[r.regime] = (counts[r.regime] ?? 0) + 1;
+        }
+        return Object.entries(counts).map(([k, v]) => `${k}=${v}`).join(" ");
+    }
 
     private avg(values: number[]): number {
         if (values.length === 0) return 0;

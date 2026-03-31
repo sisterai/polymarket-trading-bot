@@ -228,23 +228,36 @@ class RegimeDetector {
     // 0.85 = last 45 seconds of a 5-min round.
     private static readonly EXPIRY_THRESHOLD = 0.85;
 
-    // Momentum: minimum |trend| (after 10x scaling in feature space) to qualify.
-    private static readonly MOMENTUM_TREND_THRESHOLD = 0.3;
-    // Momentum: minimum volatility to confirm the move is real, not a single tick.
-    private static readonly MOMENTUM_VOL_FLOOR = 0.02;
+    // ── Value ranges for a token priced 0.40-0.60 ──
+    //
+    // rawTrend = emaShort - emaLong:  typical range [-0.03, +0.03]
+    // rawMomentum = (cur - lag1)/lag1: typical range [-0.10, +0.10]
+    // rawVolatility = std dev of ~5 prices: typical range [0.003, 0.03]
+    //
+    // Thresholds must be calibrated to these RAW ranges, not feature-space.
 
-    // Chop: maximum volatility AND |trend| to classify as ranging.
-    private static readonly CHOP_VOL_CEILING = 0.10;
-    private static readonly CHOP_TREND_CEILING = 0.10;
+    // Momentum: strong directional move.
+    // |EMA trend| > 0.01 means short EMA is diverging from long EMA.
+    private static readonly MOMENTUM_TREND_THRESHOLD = 0.01;
+    // |momentum| > 2% rate of change.
+    private static readonly MOMENTUM_MOM_THRESHOLD = 0.02;
+    // Std dev > 0.005 confirms the move involves actual price variation.
+    private static readonly MOMENTUM_VOL_FLOOR = 0.005;
+
+    // Chop: flat, ranging market — no directional signal.
+    // Std dev < 0.005 = prices barely moving.
+    private static readonly CHOP_VOL_CEILING = 0.005;
+    // |EMA trend| < 0.003 = EMAs are basically flat.
+    private static readonly CHOP_TREND_CEILING = 0.003;
+    // |momentum| < 1% = no meaningful recent move.
+    private static readonly CHOP_MOM_CEILING = 0.01;
 
     /**
      * Classify market regime from pre-computed indicators.
-     * Called before pole detection so the regime can influence
-     * whether a prediction is triggered.
      *
-     * @param momentum  raw momentum value (not yet clamped to feature range)
-     * @param volatility  raw volatility (std dev of recent prices)
-     * @param trend  raw trend value (before 10x scaling)
+     * @param momentum  raw: (cur - lag1) / lag1, typically [-0.10, +0.10]
+     * @param volatility  raw: std dev of recent smoothed prices, typically [0.003, 0.03]
+     * @param trend  raw: emaShort - emaLong, typically [-0.03, +0.03]
      * @param timeRemaining  fraction of round elapsed [0, 1], or null
      */
     detect(momentum: number, volatility: number, trend: number, timeRemaining: number | null): MarketRegime {
@@ -259,14 +272,14 @@ class RegimeDetector {
         // Momentum: strong directional conviction from both trend and momentum.
         if (absTrend > RegimeDetector.MOMENTUM_TREND_THRESHOLD &&
             volatility > RegimeDetector.MOMENTUM_VOL_FLOOR &&
-            absMom > 0.02) {
+            absMom > RegimeDetector.MOMENTUM_MOM_THRESHOLD) {
             return "momentum";
         }
 
         // Chop: flat, low-energy market — nothing to trade.
         if (volatility < RegimeDetector.CHOP_VOL_CEILING &&
             absTrend < RegimeDetector.CHOP_TREND_CEILING &&
-            absMom < 0.02) {
+            absMom < RegimeDetector.CHOP_MOM_CEILING) {
             return "chop";
         }
 
@@ -671,8 +684,14 @@ class EdgeCalculator {
 
 // ═══════════════════════════════════════════════════════════════════════════
 // AdaptivePricePredictor (Orchestrator)
-// Owns the price buffer, noise filter, stability tracker, model weights,
-// and accuracy history. Delegates to the four components above.
+// Owns the price buffer, adaptive noise filter, model weights, and
+// accuracy history. Delegates to five components:
+//   PoleDetector, RegimeDetector, FeatureExtractor, EdgeCalculator, Diagnostics
+//
+// Prediction trigger is regime-conditioned:
+//   reversal/chop → pole-only
+//   momentum      → pole OR 2+ updates since last prediction
+//   expiry        → pole OR 1+ update since last prediction
 // ═══════════════════════════════════════════════════════════════════════════
 
 export class AdaptivePricePredictor {
@@ -1086,6 +1105,7 @@ export class AdaptivePricePredictor {
         this.smoothedPrice = null;
         this.lastAddedPrice = null;
         this.lastRawPrice = null;
+        this.updatesSinceLastPrediction = 0;
         // Discard pending prediction — it belongs to the old market cycle
         // and the outcome will never arrive in the new cycle.
         this.pending = null;
