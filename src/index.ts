@@ -6,7 +6,7 @@ import { config } from "./config";
 
 import { CopytradeArbBot } from "./order-builder/copytrade";
 import { setupConsoleFileLogging } from "./utils/console-file";
-import { logger } from "@mgcrae/pino-pretty-logger"
+import { logger } from "./utils/logger";
 
 // Capture ALL console output (stdout/stderr) into a local file.
 // Configure via env var:

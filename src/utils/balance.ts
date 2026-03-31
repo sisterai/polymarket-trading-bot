@@ -1,5 +1,23 @@
-import { ClobClient, AssetType, type OpenOrder } from "@polymarket/clob-client";
+import { ClobClient, AssetType } from "@polymarket/clob-client";
+import { getContractConfig } from "@polymarket/clob-client";
+import { config } from "../config";
 import { logger } from "./logger";
+
+function extractCollateralAllowanceMicro(balanceResponse: any): number {
+    // Newer CLOB responses expose allowances per spender (Exchange, NegRisk*, etc.)
+    // Older responses may expose a direct `allowance` field.
+    const direct = parseFloat(balanceResponse?.allowance ?? "NaN");
+    if (Number.isFinite(direct)) return direct;
+
+    const allowances: Record<string, string> | undefined = balanceResponse?.allowances;
+    if (!allowances || typeof allowances !== "object") return 0;
+
+    const chainId = config.chainId;
+    const exchange = getContractConfig(chainId).exchange.toLowerCase();
+    const raw = allowances[exchange] ?? allowances[Object.keys(allowances).find((k) => k.toLowerCase() === exchange) ?? ""];
+    const n = parseFloat(raw ?? "0");
+    return Number.isFinite(n) ? n : 0;
+}
 
 /**
  * Calculate available balance for placing orders
@@ -18,6 +36,12 @@ export async function getAvailableBalance(
         });
 
         const totalBalance = parseFloat(balanceResponse.balance || "0");
+        const totalAllowance = assetType === AssetType.COLLATERAL ? extractCollateralAllowanceMicro(balanceResponse) : 0;
+
+        // For COLLATERAL (USDC), CLOB enforces both balance and allowance.
+        // The true spendable amount is min(balance, allowance).
+        const spendableTotal =
+            assetType === AssetType.COLLATERAL ? Math.min(totalBalance, totalAllowance) : totalBalance;
 
         // Get open orders for this asset
         const openOrders = await client.getOpenOrders(
@@ -45,10 +69,10 @@ export async function getAvailableBalance(
             }
         }
 
-        const availableBalance = totalBalance - reservedAmount;
+        const availableBalance = spendableTotal - reservedAmount;
 
         logger.debug(
-            `Balance check: Total=${totalBalance}, Reserved=${reservedAmount}, Available=${availableBalance}`
+            `Balance check: Balance=${totalBalance}, Allowance=${totalAllowance}, Reserved=${reservedAmount}, Available=${availableBalance}`
         );
 
         return Math.max(0, availableBalance);
@@ -70,15 +94,19 @@ export async function displayWalletBalance(client: ClobClient): Promise<{ balanc
             asset_type: AssetType.COLLATERAL,
         });
 
-        const balance = parseFloat(balanceResponse.balance || "0");
-        const allowance = parseFloat(balanceResponse.allowance || "0");
+        // CLOB returns USDC values in micro-units (1e6) for collateral.
+        const balance = parseFloat(balanceResponse.balance || "0") / 10 ** 6;
+        const allowance = extractCollateralAllowanceMicro(balanceResponse) / 10 ** 6;
+        const available = Math.min(balance, allowance || balance);
 
         logger.info("═══════════════════════════════════════");
         logger.info("💰 WALLET BALANCE & ALLOWANCE");
         logger.info("═══════════════════════════════════════");
         logger.info(`USDC Balance: ${balance.toFixed(6)}`);
         logger.info(`USDC Allowance: ${allowance.toFixed(6)}`);
-        logger.info(`Available: ${balance.toFixed(6)} (Balance: ${balance.toFixed(6)}, Allowance: ${allowance.toFixed(6)})`);
+        logger.info(
+            `Available: ${available.toFixed(6)} (Balance: ${balance.toFixed(6)}, Allowance: ${allowance.toFixed(6)})`
+        );
         logger.info("═══════════════════════════════════════");
 
         return { balance, allowance };
@@ -102,7 +130,7 @@ export async function validateBuyOrderBalance(
         });
 
         const balance = parseFloat(balanceResponse.balance || "0") / 10 ** 6;
-        const allowance = parseFloat(balanceResponse.allowance || "0") / 10 ** 6;
+        const allowance = extractCollateralAllowanceMicro(balanceResponse) / 10 ** 6;
         const available = (await getAvailableBalance(client, AssetType.COLLATERAL)) / 10 ** 6;
         const valid = available >= requiredAmount;
 
@@ -179,7 +207,7 @@ export async function waitForMinimumUsdcBalance(
             });
 
             const balance = parseFloat(balanceResponse.balance || "0") / 10 ** 6;
-            const allowance = parseFloat(balanceResponse.allowance || "0") / 10 ** 6;
+            const allowance = extractCollateralAllowanceMicro(balanceResponse) / 10 ** 6;
             const available = (await getAvailableBalance(client, AssetType.COLLATERAL)) / 10 ** 6;
 
             logger.info("═══════════════════════════════════════");
@@ -187,7 +215,9 @@ export async function waitForMinimumUsdcBalance(
             logger.info("═══════════════════════════════════════");
             logger.info(`USDC Balance: ${balance.toFixed(6)}`);
             logger.info(`USDC Allowance: ${allowance.toFixed(6)}`);
-            logger.info(`Available: ${balance.toFixed(6)} (Balance: ${balance.toFixed(6)}, Allowance: ${allowance.toFixed(6)})`);
+            logger.info(
+                `Available: ${available.toFixed(6)} (Balance: ${balance.toFixed(6)}, Allowance: ${allowance.toFixed(6)})`
+            );
             logger.info("═══════════════════════════════════════");
 
             const ok = available >= minimumUsd;

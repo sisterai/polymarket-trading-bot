@@ -215,8 +215,10 @@ export async function approveUSDCAllowance(): Promise<void> {
 export async function updateClobBalanceAllowance(client: ClobClient): Promise<void> {
     try {
         logger.info("Updating CLOB API balance allowance for USDC...");
+        // NOTE: `getBalanceAllowance` may return `allowances` (map per spender) rather than a single `allowance`.
+        // The update call is still valuable (it syncs CLOB’s view), but we don't block on a single numeric field.
         await client.updateBalanceAllowance({ asset_type: AssetType.COLLATERAL });
-        logger.info("✅ CLOB API balance allowance updated for USDC");
+        logger.info("✅ CLOB API balance allowance sync requested for USDC");
     } catch (error) {
         logger.error(`Failed to update CLOB balance allowance: ${error instanceof Error ? error.message : String(error)}`);
         throw error;
