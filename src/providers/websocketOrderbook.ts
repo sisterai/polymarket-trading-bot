@@ -1,23 +1,12 @@
 import WebSocket from "ws";
 import { logger } from "../utils/logger";
-import { readFileSync, existsSync } from "fs";
-import { resolve } from "path";
+import { config } from "../config";
 import type { ApiKeyCreds } from "@polymarket/clob-client";
 
 const MARKET_CHANNEL = "market";
 const USER_CHANNEL = "user";
 const WS_URL = "wss://ws-subscriptions-clob.polymarket.com";
 const PING_INTERVAL_MS = 10000; // 10 seconds
-
-export interface OrderBookLevel {
-    price: string;
-    size: string;
-}
-
-export interface OrderBookSnapshot {
-    bids: OrderBookLevel[];
-    asks: OrderBookLevel[];
-}
 
 export interface TokenPrice {
     tokenId: string;
@@ -447,47 +436,4 @@ export class WebSocketOrderBook {
         return this.isConnected && this.ws?.readyState === WebSocket.OPEN;
     }
 }
-
-/**
- * Get WebSocket orderbook client for market data
- */
-let cachedOrderBookClient: WebSocketOrderBook | null = null;
-
-export async function getWebSocketOrderBook(
-    assetIds: string[],
-    auth?: ApiKeyCreds
-): Promise<WebSocketOrderBook> {
-    // Load auth if not provided
-    let apiKeyCreds: ApiKeyCreds | null = auth || null;
-
-    if (!apiKeyCreds) {
-        const credentialPath = resolve(process.cwd(), "src/data/credential.json");
-        if (existsSync(credentialPath)) {
-            const creds = JSON.parse(readFileSync(credentialPath, "utf-8"));
-            const secretBase64 = creds.secret.replace(/-/g, '+').replace(/_/g, '/');
-            apiKeyCreds = {
-                key: creds.key,
-                secret: secretBase64,
-                passphrase: creds.passphrase,
-            };
-        }
-    }
-
-    // Create new client if needed
-    if (!cachedOrderBookClient || !cachedOrderBookClient.isReady()) {
-        cachedOrderBookClient = new WebSocketOrderBook(MARKET_CHANNEL, assetIds, apiKeyCreds);
-        await cachedOrderBookClient.connect();
-    } else {
-        // Subscribe to new asset IDs if needed
-        const newIds = assetIds.filter(id => !cachedOrderBookClient!.subscribedAssetIds.has(id));
-        if (newIds.length > 0) {
-            cachedOrderBookClient.subscribeToTokenIds(newIds);
-        }
-    }
-
-    return cachedOrderBookClient;
-}
-
-// Import config for debug flag
-import { config } from "../config";
 

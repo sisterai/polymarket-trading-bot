@@ -1,5 +1,5 @@
 {
-  "name": "polymarket-arbitrage-gabagool-fork",
+  "name": "polymarket-updown-prediction-bot",
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
@@ -7,16 +7,18 @@
     "redeem": "ts-node src/redeem.ts",
     "redeem:holdings": "ts-node src/redeem-holdings.ts",
     "redeem:proxy": "ts-node src/redeem-proxy.ts",
+    "redeem:auto": "ts-node src/redeem/auto-redeem.ts",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [
     "polymarket",
     "prediction-market",
-    "gabagool"
+    "trading-bot",
+    "updown"
   ],
   "author": "CrewSX Solutions",
   "license": "ISC",
-  "description": "Polymarket Arbitrage Trading Bot, Forked from Gabagool22's Bot",
+  "description": "Polymarket Up/Down Prediction Trading Bot",
   "devDependencies": {
     "@types/node": "^24.10.1",
     "ts-node": "^10.9.2",

@@ -1,16 +1,13 @@
-# Polymarket Arbitrage Bot · Polymarket Trading Bot · @distict-baguette Fork
+# Polymarket Up/Down Prediction Trading Bot
 
-**Polymarket arbitrage bot** and **Polymarket copytrading bot** for automated prediction-market trading. This **Polymarket trading bot** that trades Polymarket’s 15-minute Up/Down markets (e.g. BTC, ETH) using the CLOB API, WebSocket orderbook, and an adaptive price predictor.
+**Polymarket prediction trading bot** for automated 15-minute Up/Down crypto market trading. Uses the CLOB API, WebSocket orderbook, and an adaptive price predictor to place directional + hedge paired trades.
 
 ---
 
 
 ## What this bot does
 
-Automated **Polymarket** trading on **15-minute Up/Down markets**. It uses a price predictor to choose direction, places a first-side limit at best ask, then hedges with a second-side limit at `0.98 − firstSidePrice`. Built with TypeScript and Polymarket’s CLOB API. Suitable as a **Polymarket arbitrage bot** or **Polymarket copytrading bot** for 15m markets.
-
-
-## Proof of work
+Automated **Polymarket** trading on **15-minute Up/Down markets** (BTC, ETH, SOL, etc.). It uses an adaptive price predictor to detect price poles (peaks/troughs), predict direction, then places a first-side limit order at best ask and a second-side hedge at `0.98 − firstSidePrice`. Built with TypeScript and Polymarket's CLOB API.
 
 
 ## Overview
@@ -35,7 +32,7 @@ npm install
 
 ## Configuration
 
-Copy the example env and set at least `PRIVATE_KEY` and `COPYTRADE_MARKETS`:
+Copy the example env and set at least `PRIVATE_KEY` and `TRADING_MARKETS`:
 
 ```bash
 cp .env.temp .env
@@ -44,23 +41,25 @@ cp .env.temp .env
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `PRIVATE_KEY` | Wallet private key | **required** |
-| `COPYTRADE_MARKETS` | Comma-separated markets (e.g. `btc`) | `btc` |
-| `COPYTRADE_SHARES` | Shares per side per trade | `5` |
-| `COPYTRADE_TICK_SIZE` | Price precision | `0.01` |
-| `COPYTRADE_PRICE_BUFFER` | Price buffer for execution | `0` |
-| `COPYTRADE_WAIT_FOR_NEXT_MARKET_START` | Wait for next 15m boundary before starting | `false` |
-| `COPYTRADE_MAX_BUY_COUNTS_PER_SIDE` | Max buys per side per market (0 = no cap) | `0` |
+| `TRADING_MARKETS` | Comma-separated markets (e.g. `btc`) | `btc` |
+| `TRADING_SHARES` | Shares per side per trade | `5` |
+| `TRADING_TICK_SIZE` | Price precision | `0.01` |
+| `TRADING_PRICE_BUFFER` | Price buffer for execution | `0` |
+| `TRADING_WAIT_FOR_NEXT_MARKET_START` | Wait for next 15m boundary before starting | `false` |
+| `TRADING_MAX_BUY_COUNTS_PER_SIDE` | Max buys per side per market (0 = no cap) | `0` |
 | `CHAIN_ID` | Chain ID (Polygon) | `137` |
 | `CLOB_API_URL` | Polymarket CLOB API base URL | `https://clob.polymarket.com` |
 | `RPC_URL` / `RPC_TOKEN` | RPC for allowances/redemption | — |
 | `BOT_MIN_USDC_BALANCE` | Min USDC to start | `1` |
 | `LOG_DIR` / `LOG_FILE_PREFIX` | Log directory and file prefix | `logs` / `bot` |
 
+> Legacy `COPYTRADE_*` env vars are still supported as fallback for backward compatibility.
+
 API credentials are created on first run and stored in `src/data/credential.json`.
 
 ## Usage
 
-**Run the Polymarket trading bot**
+**Run the prediction trading bot**
 
 ```bash
 npm start
@@ -72,12 +71,12 @@ npm start
 ```bash
 # Auto-redeem resolved markets (holdings file)
 npm run redeem:holdings
-# or: bun src/auto-redeem.ts [--dry-run] [--clear-holdings] [--api] [--max N]
 
 # Redeem by condition ID
 npm run redeem
-# or: bun src/redeem.ts [conditionId] [indexSets...]
-bun src/redeem.ts --check <conditionId>
+
+npm run redeem:auto -- --api --full --pools-within-hours 6 --no-redeemable-filter
+
 ```
 
 **Development**
@@ -91,16 +90,16 @@ bun --watch src/index.ts
 
 | Path | Role |
 |------|------|
-| `src/index.ts` | Entry: credentials, CLOB, allowances, min balance, start `CopytradeArbBot`. |
-| `src/config/index.ts` | Loads `.env` and exposes config (chain, CLOB, copytrade, logging). |
-| `src/order-builder/copytrade.ts` | **CopytradeArbBot**: 15m slug resolution, WebSocket orderbook, predictor → first-side buy + second-side hedge; state in `src/data/copytrade-state.json`. |
+| `src/index.ts` | Entry: credentials, CLOB, allowances, min balance, start `UpDownPredictionBot`. |
+| `src/config/index.ts` | Loads `.env` and exposes config (chain, CLOB, trading, logging). |
+| `src/order-builder/updown-bot.ts` | **UpDownPredictionBot**: 15m slug resolution, WebSocket orderbook, predictor → first-side buy + second-side hedge; state in `src/data/bot-state.json`. |
 | `src/providers/clobclient.ts` | Polymarket CLOB client singleton (credentials + `PRIVATE_KEY`). |
 | `src/providers/websocketOrderbook.ts` | WebSocket to Polymarket CLOB market channel; best bid/ask by token ID. |
 | `src/utils/pricePredictor.ts` | **AdaptivePricePredictor**: direction, confidence, signal (BUY_UP / BUY_DOWN / HOLD). |
 | `src/utils/redeem.ts` | CTF redemption, resolution checks, auto-redeem from holdings or API. |
 | `src/security/allowance.ts` | USDC and CTF approvals. |
 | `src/data/token-holding.json` | Token holdings for redemption (generated). |
-| `src/data/copytrade-state.json` | Per-slug state (prices, timestamps, buy counts). |
+| `src/data/bot-state.json` | Per-slug state (prices, timestamps, buy counts). |
 
 ## Risk and disclaimer
 

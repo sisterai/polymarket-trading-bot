@@ -81,12 +81,9 @@ export class AdaptivePricePredictor {
     private emaLong = 0.5; // Slow EMA (5 periods) - medium response
     private readonly alphaShort = 2 / (2 + 1); // Faster EMA
     private readonly alphaLong = 2 / (5 + 1); // Medium EMA
-    // Additional trend indicators
-    private priceChangeHistory: number[] = []; // Track recent price changes for trend
     
     // Pole detection (peaks and troughs) - only predict at pole values
     private poleHistory: Array<{ price: number; type: "peak" | "trough"; timestamp: number }> = [];
-    private readonly minPoleWindow = 3; // Minimum points before/after to confirm a pole
     private lastPolePrice: number | null = null;
     private lastPoleType: "peak" | "trough" | null = null;
     private lastPrediction: PricePrediction | null = null; // Store last prediction for pole-based updates
@@ -520,21 +517,6 @@ export class AdaptivePricePredictor {
         // Use weighted average: 60% recent, 40% overall (recent performance is more important)
         const accuracyRate = recentAccuracy * 0.6 + overallAccuracy * 0.4;
         
-        // Confidence calibration: adjust based on actual accuracy vs predicted confidence
-        // If recent high-confidence predictions were often wrong, reduce confidence
-        if (this.recentPredictions.length >= 10) {
-            const highConfPredictions = this.recentPredictions.filter(p => p.confidence >= 0.80);
-            if (highConfPredictions.length > 0) {
-                const highConfAccuracy = highConfPredictions.filter(p => p.correct).length / highConfPredictions.length;
-                // If high confidence predictions have low accuracy, we're overconfident
-                if (highConfAccuracy < 0.65 && highConfPredictions.length >= 5) {
-                    // Reduce confidence for overconfident predictions
-                    const overconfidencePenalty = 1.0 - (0.65 - highConfAccuracy) * 2.0; // Penalty up to 30%
-                    // This will be applied later in the confidence calculation
-                }
-            }
-        }
-        
         // Stability penalty: reduce confidence if price has been stable for too long
         let stabilityFactor = 1.0;
         if (this.stablePriceCount > this.maxStableCount) {
@@ -900,25 +882,6 @@ export class AdaptivePricePredictor {
     }
     
     /**
-     * Get default prediction when not enough data
-     * Always returns "up" or "down", never "neutral"
-     */
-    private getDefaultPrediction(price: number): PricePrediction {
-        // Default to "up" when not enough data (neutral+up → up)
-        return {
-            predictedPrice: price,
-            confidence: 0.3,
-            direction: "up",
-            signal: "HOLD",
-            features: {
-                momentum: 0,
-                volatility: 0.1,
-                trend: 0,
-            },
-        };
-    }
-    
-    /**
      * Get prediction accuracy statistics
      */
     public getAccuracyStats(): { accuracy: number; totalPredictions: number; correctPredictions: number } {
@@ -946,7 +909,6 @@ export class AdaptivePricePredictor {
         this.lastPoleType = null;
         this.lastPoleTimestamp = null;
         this.lastPrediction = null;
-        this.priceChangeHistory = [];
         // Keep weights (they represent learned knowledge)
     }
 }

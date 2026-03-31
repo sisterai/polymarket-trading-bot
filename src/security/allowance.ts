@@ -1,4 +1,4 @@
-import { Zero, MaxUint256 } from "@ethersproject/constants";
+import { MaxUint256 } from "@ethersproject/constants";
 import { BigNumber } from "@ethersproject/bignumber";
 import { parseUnits } from "@ethersproject/units";
 import { Wallet } from "@ethersproject/wallet";
@@ -225,62 +225,4 @@ export async function updateClobBalanceAllowance(client: ClobClient): Promise<vo
     }
 }
 
-/**
- * Approve ConditionalTokens for Exchange after buying tokens
- * This ensures tokens are approved immediately after purchase so they can be sold without delay
- * Note: ERC1155 uses setApprovalForAll which approves all tokens at once (including newly bought ones)
- */
-export async function approveTokensAfterBuy(): Promise<void> {
-    const privateKey = config.requirePrivateKey();
-
-    const chainId = (config.chainId || Chain.POLYGON) as Chain;
-    const contractConfig = getContractConfig(chainId);
-    
-    // Get RPC URL and create provider
-    const { provider, rpcUrl } = await getWorkingProvider(chainId);
-    const wallet = new Wallet(privateKey, provider);
-    
-    const address = await wallet.getAddress();
-    logger.info(`RPC: ${rpcUrl}`);
-    const ctfContract = new Contract(contractConfig.conditionalTokens, CTF_ABI, wallet);
-
-    // Configure gas options
-    let gasOptions: { gasPrice?: BigNumber; gasLimit?: number } = {};
-    try {
-        const gasPrice = await provider.getGasPrice();
-        gasOptions = {
-            gasPrice: gasPrice.mul(120).div(100), // 20% buffer
-            gasLimit: 200_000,
-        };
-    } catch (error) {
-        gasOptions = {
-            gasPrice: parseUnits("100", "gwei"),
-            gasLimit: 200_000,
-        };
-    }
-
-    // Check if ConditionalTokens are approved for Exchange
-    const isApproved = await ctfContract.isApprovedForAll(address, contractConfig.exchange);
-    
-    if (!isApproved) {
-        logger.info("Approving ConditionalTokens for Exchange (after buy)...");
-        const tx = await ctfContract.setApprovalForAll(contractConfig.exchange, true, gasOptions);
-        logger.info(`Transaction hash: ${tx.hash}`);
-        await tx.wait();
-        logger.info("✅ ConditionalTokens approved for Exchange");
-    }
-
-    // If negRisk is enabled, also check negRisk contracts
-    const negRisk = config.negRisk;
-    if (negRisk) {
-        const isNegRiskApproved = await ctfContract.isApprovedForAll(address, contractConfig.negRiskExchange);
-        if (!isNegRiskApproved) {
-            logger.info("Approving ConditionalTokens for NegRiskExchange (after buy)...");
-            const tx = await ctfContract.setApprovalForAll(contractConfig.negRiskExchange, true, gasOptions);
-            logger.info(`Transaction hash: ${tx.hash}`);
-            await tx.wait();
-            logger.info("✅ ConditionalTokens approved for NegRiskExchange");
-        }
-    }
-}
 

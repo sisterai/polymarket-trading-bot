@@ -112,11 +112,3 @@ export async function getClobClient(): Promise<ClobClient> {
 
     return cachedClient;
 }
-
-/**
- * Clear cached ClobClient (useful for testing or re-initialization)
- */
-export function clearClobClientCache(): void {
-    cachedClient = null;
-    cachedConfig = null;
-}
