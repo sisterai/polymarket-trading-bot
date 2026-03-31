@@ -4,19 +4,20 @@ import * as path from "path";
 import { logger } from "../utils/logger";
 import { config } from "../config";
 import { WebSocketOrderBook, TokenPrice } from "../providers/websocketOrderbook";
-import { AdaptivePricePredictor, PricePrediction } from "../utils/pricePredictor";
+import { AdaptivePricePredictor, PricePrediction, MarketSnapshot } from "../utils/pricePredictor";
 // Helper functions for market slug and token IDs
-function slugForCurrent5m(market: string): string {
-    const now = new Date();
-    const d = new Date(now);
+/** Returns the ms epoch of the current 5-minute slot's start boundary. */
+function current5mSlotStartMs(): number {
+    const d = new Date();
     d.setSeconds(0, 0);
     d.setMilliseconds(0);
-    const m = d.getMinutes();
-    const slotMin = Math.floor(m / 5) * 5;
-    d.setMinutes(slotMin, 0, 0);
-    // Get Unix timestamp in seconds for the start of this 5-minute slot
-    const timestamp = Math.floor(d.getTime() / 1000);
-    // Format: {market}-updown-5m-{timestamp}
+    d.setMinutes(Math.floor(d.getMinutes() / 5) * 5);
+    return d.getTime();
+}
+
+function slugForCurrent5m(market: string): string {
+    const startMs = current5mSlotStartMs();
+    const timestamp = Math.floor(startMs / 1000);
     return `${market}-updown-5m-${timestamp}`;
 }
 
@@ -398,8 +399,21 @@ export class UpDownPredictionBot {
                 this.pricePredictors.set(market, predictor);
             }
 
+            // Build rich snapshot from available WebSocket data
+            const snapshot: MarketSnapshot = {
+                bestAsk: upAsk,
+                bestBid: upPrice.bestBid,
+                spread: upPrice.spread,
+                mid: upPrice.mid,
+                bidSize: null,   // TODO: populate when book events are parsed
+                askSize: null,   // TODO: populate when book events are parsed
+                downAsk: downAsk,
+                timestamp: Date.now(),
+                roundStartTime: current5mSlotStartMs(),
+            };
+
             // Get prediction for UP token - ONLY returns prediction at pole values, null otherwise
-            const prediction = predictor.updateAndPredict(upAsk, Date.now());
+            const prediction = predictor.updateAndPredictWithSnapshot(snapshot);
 
             // Only process if we have a prediction (at pole value)
             if (!prediction) {
@@ -435,22 +449,18 @@ export class UpDownPredictionBot {
             });
 
             // Log prediction details (only at pole values)
-            logger.info(`🔮 PREDICT [POLE]: ${prediction.predictedPrice.toFixed(4)} (current: ${upAsk.toFixed(4)}) | Direction: ${prediction.direction.toUpperCase()} | Confidence: ${(prediction.confidence * 100).toFixed(1)}% | Signal: ${prediction.signal} | Momentum: ${prediction.features.momentum.toFixed(3)} | Vol: ${prediction.features.volatility.toFixed(3)} | Trend: ${prediction.features.trend.toFixed(3)}`);
+            const bestEdge = Math.max(prediction.edgeBuyUp, prediction.edgeBuyDown);
+            logger.info(`🔮 PREDICT [POLE]: pUp=${prediction.pUp.toFixed(3)} | Edge=${(bestEdge * 100).toFixed(1)}% | Dir: ${prediction.direction.toUpperCase()} | Signal: ${prediction.signal} | Pred: ${prediction.predictedPrice.toFixed(4)} (cur: ${upAsk.toFixed(4)}) | Mom: ${prediction.features.momentum.toFixed(3)} | Vol: ${prediction.features.volatility.toFixed(3)} | Trend: ${prediction.features.trend.toFixed(3)}`);
 
             // Execute prediction-based trading strategy
             this.executePredictionTrade(market, slug, prediction, upAsk, downAsk, currentTokenIds);
 
-            // Log accuracy stats periodically (every 25 predictions, and at milestones)
-            const stats = predictor.getAccuracyStats();
-            if (stats.totalPredictions > 0) {
-                // Log every 25 predictions
-                if (stats.totalPredictions % 25 === 0) {
-                    logger.info(`📊 Prediction Accuracy: ${(stats.accuracy * 100).toFixed(1)}% (${stats.correctPredictions}/${stats.totalPredictions})`);
-                }
-                // Also log at key milestones (10, 50, 100, 200, etc.)
-                else if ([10, 50, 100, 200, 500, 1000].includes(stats.totalPredictions)) {
-                    logger.info(`📊 Prediction Accuracy: ${(stats.accuracy * 100).toFixed(1)}% (${stats.correctPredictions}/${stats.totalPredictions})`);
-                }
+            // Log diagnostics periodically
+            const diagStats = predictor.getDiagnostics().getStats();
+            if (diagStats.totalPredictions > 0 &&
+                (diagStats.totalPredictions % 25 === 0 ||
+                 [10, 50, 100, 200, 500, 1000].includes(diagStats.totalPredictions))) {
+                logger.info(predictor.getDiagnostics().formatStatsLog());
             }
 
             // Update previous UP ask price (always update for next comparison)
@@ -605,20 +615,22 @@ export class UpDownPredictionBot {
 
         const score = this.predictionScores.get(scoreKey)!;
 
-        // CRITICAL: Only trade on high-confidence predictions to improve success rate
-        // Wrong predictions have avg confidence ~48%, correct ones ~65%
-        // Filter out low-confidence predictions to reduce losses
-        // Reduced threshold to 50% to allow more trades with limit order second side strategy
-        const minConfidenceForTrade = 0.50; // Reduced from 60% to 50% to allow more trades
-
-        // Check confidence and signal before trading
-        if (prediction.confidence < minConfidenceForTrade) {
-            return; // Skip silently to reduce log noise
+        // Skip if signal is HOLD (edge insufficient or volatility circuit breaker)
+        if (prediction.signal === "HOLD") {
+            return;
         }
 
-        // Skip if signal is HOLD (indicates uncertainty)
-        if (prediction.signal === "HOLD") {
-            return; // Skip silently to reduce log noise
+        // Safety hook: check diagnostics health before trading
+        const predictor = this.pricePredictors.get(market);
+        if (predictor) {
+            const health = predictor.getDiagnostics().getHealthStatus();
+            if (!health.tradingAllowed) {
+                logger.warning(`SAFETY: trading disabled - ${health.warnings.join(", ")}`);
+                return;
+            }
+            if (health.warnings.length > 0) {
+                logger.warning(`DIAGNOSTICS: ${health.warnings.join("; ")}`);
+            }
         }
 
         // Only increment totalPredictions when we actually make a trade
@@ -687,12 +699,14 @@ export class UpDownPredictionBot {
             this.cfg.sharesPerSide,
         );
 
-        // Place second-side limit order IMMEDIATELY (within 50ms) without waiting for first order response
-        // This ensures both orders are placed almost simultaneously for better execution
+        // Place second-side limit order IMMEDIATELY (within 50ms) without waiting for first order response.
+        // Pass the actual opposite-side ask so the limit price reflects real market conditions.
+        const oppositeAsk = buyToken === "UP" ? downAsk : upAsk;
 
         this.placeSecondSideLimitOrder(
             buyToken,
             buyPrice,
+            oppositeAsk,
             tokenIds,
             market,
             slug,
@@ -726,11 +740,13 @@ export class UpDownPredictionBot {
     }
 
     /**
-     * Place limit order for second side (opposite token) at price (0.99 - firstSidePrice)
+     * Place limit order for second side (opposite token).
+     * Uses the actual opposite-side ask price minus a small discount for fill probability.
      */
     private async placeSecondSideLimitOrder(
         firstSide: "UP" | "DOWN",
         firstSidePrice: number,
+        oppositeAsk: number,
         tokenIds: { upTokenId: string; downTokenId: string; conditionId: string; upIdx: number; downIdx: number },
         market: string,
         slug: string,
@@ -743,15 +759,26 @@ export class UpDownPredictionBot {
 
         // CRITICAL: Check if market is paused FIRST
         if (this.pausedMarkets.has(scoreKey)) {
-            return; // Market is paused, don't place limit orders
+            return;
         }
 
-        // Calculate limit price: (0.99 - firstSidePrice)
-        const limitPrice = 0.98 - firstSidePrice;
+        // Use actual opposite-side ask minus a small discount (2 cents) for better fill.
+        // Fallback to (0.98 - firstSidePrice) if opposite ask is unavailable.
+        const LIMIT_DISCOUNT = 0.02;
+        let limitPrice: number;
+        if (oppositeAsk > 0 && oppositeAsk < 1) {
+            limitPrice = oppositeAsk - LIMIT_DISCOUNT;
+        } else {
+            limitPrice = 0.98 - firstSidePrice;
+        }
 
-        // Ensure limit price is valid (between 0 and 1)
-        if (limitPrice <= 0 || limitPrice >= 1) {
-            logger.error(`⚠️  Invalid limit price calculated: ${limitPrice.toFixed(4)} (from first side price ${firstSidePrice.toFixed(4)})`);
+        // Clamp to valid range and ensure total cost (first + second) stays under 0.98
+        // for built-in profit margin at resolution.
+        const maxSecondPrice = Math.min(0.97, 0.98 - firstSidePrice);
+        limitPrice = Math.min(limitPrice, maxSecondPrice);
+
+        if (limitPrice <= 0.01 || limitPrice >= 0.97) {
+            logger.error(`⚠️  Invalid limit price calculated: ${limitPrice.toFixed(4)} (opposite ask: ${oppositeAsk.toFixed(4)}, first side: ${firstSidePrice.toFixed(4)})`);
             return;
         }
 
@@ -979,9 +1006,16 @@ export class UpDownPredictionBot {
         const scores = Array.from(this.predictionScores.entries());
         for (const [scoreKey, score] of scores) {
             if (score.endTime === null && score.totalPredictions > 0) {
-                // Market is still active and has predictions, generate summary now
-                // Use stored market and slug from score object
                 this.generatePredictionScoreSummary(score.slug, score.market);
+            }
+        }
+
+        // Dump diagnostics summary for all predictors
+        for (const [market, predictor] of this.pricePredictors.entries()) {
+            const diag = predictor.getDiagnostics();
+            const stats = diag.getStats();
+            if (stats.totalPredictions > 0) {
+                logger.info(`\n📊 DIAGNOSTICS SUMMARY [${market}]:\n${diag.formatStatsLog()}`);
             }
         }
     }

@@ -13,6 +13,7 @@ export interface TokenPrice {
     bestBid: number | null;
     bestAsk: number | null;
     mid: number | null;
+    spread: number | null;
     timestamp: number;
 }
 
@@ -314,6 +315,16 @@ export class WebSocketOrderBook {
             mid = bestAsk;
         }
 
+        // Parse spread: prefer the WS payload field, fall back to computed bid-ask difference
+        let spread: number | null = null;
+        if (message.spread) {
+            const s = parseFloat(message.spread);
+            if (Number.isFinite(s)) spread = s;
+        }
+        if (spread === null && bestBid !== null && bestAsk !== null) {
+            spread = bestAsk - bestBid;
+        }
+
         // Use timestamp from message if available, otherwise use current time
         const timestamp = message.timestamp ? parseInt(message.timestamp, 10) : Date.now();
 
@@ -331,6 +342,7 @@ export class WebSocketOrderBook {
             bestBid,
             bestAsk,
             mid,
+            spread,
             timestamp,
         };
 
@@ -375,11 +387,16 @@ export class WebSocketOrderBook {
             mid = bestAsk;
         }
 
+        const spread = (bestBid !== null && bestAsk !== null)
+            ? bestAsk - bestBid
+            : null;
+
         const price: TokenPrice = {
             tokenId: assetId,
             bestBid,
             bestAsk,
             mid,
+            spread,
             timestamp: Date.now(),
         };
 

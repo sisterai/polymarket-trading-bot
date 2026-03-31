@@ -1,762 +1,876 @@
 import { logger } from "./logger";
+import { PredictionDiagnostics } from "./diagnostics";
 
-/**
- * Price prediction result
- */
+// ═══════════════════════════════════════════════════════════════════════════
+// Public Types
+// ═══════════════════════════════════════════════════════════════════════════
+
 export interface PricePrediction {
+    // Legacy (preserved for backward compatibility)
     predictedPrice: number;
-    confidence: number; // 0-1, higher = more confident
-    direction: "up" | "down"; // No neutral - always up or down
+    confidence: number;
+    direction: "up" | "down";
     signal: "BUY_UP" | "BUY_DOWN" | "HOLD";
     features: {
         momentum: number;
         volatility: number;
         trend: number;
     };
-    isPoleValue?: boolean; // True if prediction was made at a pole (peak/trough)
+    isPoleValue?: boolean;
+
+    // Edge-based decision fields
+    pUp: number;            // P(UP token price rises), from sigmoid on predicted move
+    pDown: number;          // 1 - pUp
+    edgeBuyUp: number;      // pUp - upAsk - cost (expected profit per share buying UP)
+    edgeBuyDown: number;    // pDown - downAsk - cost (expected profit per share buying DOWN)
+    rawScore: number;       // raw linear model output (normalized space, before denormalization)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Public Input Type
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Rich market state snapshot passed to the predictor.
+ * All fields beyond `bestAsk` and `timestamp` are optional — the predictor
+ * degrades gracefully to legacy (price-only) behavior when they are null.
+ */
+export interface MarketSnapshot {
+    // Always available from best_bid_ask events
+    bestAsk: number;
+    bestBid: number | null;
+    spread: number | null;          // ask - bid (from WS or computed)
+    mid: number | null;             // (bid + ask) / 2
+
+    // Available when book / price_change events are processed (future)
+    bidSize: number | null;         // top-of-book bid quantity
+    askSize: number | null;         // top-of-book ask quantity
+
+    // Cross-leg context (from the bot's view of both UP and DOWN tokens)
+    downAsk: number | null;
+
+    // Timing
+    timestamp: number;
+    roundStartTime: number | null;  // ms epoch of current 5-min round start
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Internal Types
+// ═══════════════════════════════════════════════════════════════════════════
+
+interface FeatureVector {
+    // ── Legacy features (price-derived) ──
+    priceLag1: number;
+    priceLag2: number;
+    priceLag3: number;
+    momentum: number;
+    volatility: number;
+    trend: number;
+
+    // ── Microstructure features (orderbook-derived) ──
+    // Spread: wider spread = less liquidity, higher uncertainty. [0, 1]
+    spread: number;
+    // Microprice: size-weighted fair value. Better than mid when book is asymmetric. [0, 1]
+    microprice: number;
+    // Book imbalance: (bidSize - askSize) / (bidSize + askSize). Buy pressure indicator. [-1, 1]
+    bookImbalance: number;
+    // Down-ask delta: upAsk - (1 - downAsk). Non-zero = cross-leg mispricing. [-1, 1]
+    downAskDelta: number;
+    // Time remaining: fraction of 5-min round elapsed. Near 1 = expiry imminent. [0, 1]
+    timeRemaining: number;
+    // Quote intensity: EMA-smoothed rate of quote updates per second. [0, 1]
+    quoteIntensity: number;
+}
+
+interface ModelWeights {
+    intercept: number;
+    // Legacy
+    priceLag1: number;
+    priceLag2: number;
+    priceLag3: number;
+    momentum: number;
+    volatility: number;
+    trend: number;
+    // Microstructure (initialized to zero — no behavior change on deploy)
+    spread: number;
+    microprice: number;
+    bookImbalance: number;
+    downAskDelta: number;
+    timeRemaining: number;
+    quoteIntensity: number;
+}
+
+interface AccuracyRecord {
+    correct: boolean;
+    confidence: number;
 }
 
 /**
- * Adaptive Multi-Feature Linear Regression Price Predictor
- * 
- * Uses multiple features (price history, momentum, volatility, spread) to predict next price.
- * Adapts weights in real-time using online gradient descent.
- * 
- * Performance: ~12-15ms per prediction
+ * Stores a prediction that has been made but not yet evaluated.
+ * The prediction is scored against the next observed pole price (the "outcome").
+ * This is the mechanism that prevents label leakage: features and predicted
+ * values are frozen at prediction time, and only evaluated once the future
+ * outcome actually arrives.
  */
-export class AdaptivePricePredictor {
-    // Price history (circular buffer) - stores smoothed prices
-    private priceHistory: number[] = [];
-    private timestamps: number[] = [];
-    private readonly maxHistorySize = 10;
-    
-    // Noise filtering - ignore changes < 0.02 (only filter UNDER 0.02, consider >= 0.02)
-    private readonly noiseThreshold = 0.02; // Ignore price changes < 0.02 (must be >= 0.02 to be considered)
-    private smoothedPrice: number | null = null; // Current smoothed price
-    private lastAddedPrice: number | null = null; // Last price added to history
-    private smoothingAlpha = 0.5; // EMA smoothing factor (0.5 = balanced, more responsive to actual price changes)
-    
-    // Stability detection (for periods of no movement)
-    private stablePriceCount = 0; // Count of consecutive stable prices
-    private readonly maxStableCount = 5; // After this many stable prices, reduce confidence
-    private lastStablePrice: number | null = null;
-    
-    // Model weights (learned parameters)
-    // IMPROVED: Based on log analysis showing stronger trend/momentum and lower volatility correlate with success
-    private weights: {
-        intercept: number;
-        priceLag1: number; // Previous price
-        priceLag2: number; // 2 periods ago
-        priceLag3: number; // 3 periods ago
-        momentum: number;
-        volatility: number;
-        trend: number;
-    } = {
-        intercept: 0.5,
-        priceLag1: 0.25, // Reduced - recent price less important than trend/momentum
-        priceLag2: 0.08,
-        priceLag3: 0.04,
-        momentum: 0.35, // INCREASED - stronger momentum correlates with success
-        volatility: -0.20, // INCREASED penalty - lower volatility strongly correlates with success
-        trend: 0.45, // INCREASED - stronger trend signals correlate with success (most reliable)
-    };
-    
-    // Learning parameters
-    private readonly learningRate = 0.05; // Increased from 0.01 for faster learning
-    private readonly minLearningRate = 0.005; // Increased minimum
-    private readonly maxLearningRate = 0.2; // Increased maximum
-    
-    // Statistics for normalization
+interface PendingPrediction {
+    features: FeatureVector;
+    predictedPrice: number;
+    basePrice: number;          // smoothed price at prediction time (for direction evaluation)
+    confidence: number;
+}
+
+function clamp(value: number, min: number, max: number): number {
+    return Math.max(min, Math.min(max, value));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PoleDetector
+// Identifies local peaks and troughs in the smoothed price history.
+// A prediction is only emitted when a new pole is detected.
+// ═══════════════════════════════════════════════════════════════════════════
+
+class PoleDetector {
+    private history: Array<{ price: number; type: "peak" | "trough"; timestamp: number }> = [];
+    private _lastPrice: number | null = null;
+    private _lastType: "peak" | "trough" | null = null;
+
+    private static readonly MAX_HISTORY = 10;
+
+    get lastPoleType(): "peak" | "trough" | null {
+        return this._lastType;
+    }
+
+    /**
+     * Returns true if the latest entry in `priceHistory` is a local
+     * peak or trough that qualifies as a new pole.
+     * TODO: this checks the latest point as the extremum (aggressive). A confirmatory
+     *       approach would wait one more point to verify the reversal.
+     */
+    detect(priceHistory: readonly number[], timestamp: number, noiseThreshold: number): boolean {
+        if (priceHistory.length < 3) return false;
+
+        const n = priceHistory.length;
+        const idx = n - 1;
+        const price = priceHistory[idx];
+        if (idx < 2) return false;
+
+        let isPeak = true;
+        let isTrough = true;
+        const lookback = Math.min(3, idx);
+        for (let i = idx - lookback; i < idx; i++) {
+            if (priceHistory[i] >= price) isPeak = false;
+            if (priceHistory[i] <= price) isTrough = false;
+        }
+
+        if (!isPeak && !isTrough) return false;
+
+        const type: "peak" | "trough" = isPeak ? "peak" : "trough";
+
+        if (this._lastPrice === null) {
+            this.record(price, type, timestamp);
+            return true;
+        }
+
+        const changeFromLast = Math.abs(price - this._lastPrice);
+        const isDifferentType = type !== this._lastType;
+
+        if (changeFromLast >= noiseThreshold || isDifferentType) {
+            this.record(price, type, timestamp);
+            return true;
+        }
+
+        return false;
+    }
+
+    private record(price: number, type: "peak" | "trough", timestamp: number): void {
+        this._lastPrice = price;
+        this._lastType = type;
+        this.history.push({ price, type, timestamp });
+        if (this.history.length > PoleDetector.MAX_HISTORY) this.history.shift();
+    }
+
+    reset(): void {
+        this.history = [];
+        this._lastPrice = null;
+        this._lastType = null;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FeatureExtractor
+// Owns EMA state and normalization statistics.
+// Extracts a 6-dimensional feature vector from a price history buffer.
+// ═══════════════════════════════════════════════════════════════════════════
+
+class FeatureExtractor {
     private priceMean = 0.5;
     private priceStd = 0.1;
+    private emaShort = 0.5;
+    private emaLong = 0.5;
+
+    // EMA-smoothed quote update rate (updates per second)
+    private quoteEma = 0;
+    private lastQuoteTimestamp: number | null = null;
+    private static readonly QUOTE_EMA_ALPHA = 0.3;
+
+    private static readonly ALPHA_SHORT = 2 / (2 + 1);
+    private static readonly ALPHA_LONG = 2 / (5 + 1);
+    private static readonly VOL_WINDOW = 5;
+    private static readonly ROUND_DURATION_MS = 5 * 60 * 1000;
+
+    /**
+     * Legacy extraction path: price-only, microstructure features set to neutral.
+     */
+    extract(priceHistory: readonly number[]): FeatureVector {
+        return this.extractWithSnapshot(priceHistory, null);
+    }
+
+    /**
+     * Full extraction: legacy price features + microstructure features from snapshot.
+     * When snapshot is null, microstructure features default to neutral values
+     * (0 or 0.5) so the model output is unchanged from legacy behavior.
+     */
+    extractWithSnapshot(priceHistory: readonly number[], snapshot: MarketSnapshot | null): FeatureVector {
+        const n = priceHistory.length;
+        const cur = priceHistory[n - 1];
+        const lag1 = n >= 2 ? priceHistory[n - 2] : cur;
+        const lag2 = n >= 3 ? priceHistory[n - 3] : lag1;
+        const lag3 = n >= 4 ? priceHistory[n - 4] : lag2;
+
+        const momentum = this.computeMomentum(cur, lag1, lag2, n);
+        // TODO: trend component weights (0.4 / 0.4 / 0.2) should be configurable
+        const trend = this.computeTrend(cur, lag2, momentum, n);
+        const volatility = this.computeVolatility(priceHistory);
+
+        return {
+            // ── Legacy features ──
+            priceLag1: this.normalizePrice(lag1),
+            priceLag2: this.normalizePrice(lag2),
+            priceLag3: this.normalizePrice(lag3),
+            // TODO: normalization scaling constants (5x, 10x) should be derived from data
+            momentum: clamp(momentum, -1, 1),
+            volatility: Math.min(1, volatility * 5),
+            trend: clamp(trend * 10, -1, 1),
+
+            // ── Microstructure features ──
+            spread: this.computeSpread(snapshot),
+            microprice: this.computeMicroprice(snapshot),
+            bookImbalance: this.computeBookImbalance(snapshot),
+            downAskDelta: this.computeDownAskDelta(snapshot),
+            timeRemaining: this.computeTimeRemaining(snapshot),
+            quoteIntensity: this.computeQuoteIntensity(),
+        };
+    }
+
+    private computeMomentum(current: number, lag1: number, lag2: number, n: number): number {
+        const shortMom = lag1 > 0 ? (current - lag1) / lag1 : 0;
+        if (n < 4) return shortMom;
+
+        const longMom = (current - lag2) / (lag2 + 0.0001);
+        const sameSign = (shortMom > 0 && longMom > 0) || (shortMom < 0 && longMom < 0);
+        return sameSign ? (shortMom + longMom) / 2 : shortMom;
+    }
+
+    private computeTrend(current: number, lag2: number, momentum: number, n: number): number {
+        const emaTrend = this.emaShort - this.emaLong;
+        const momTrend = momentum * 0.5;
+        const priceTrend = n >= 3 ? (current - lag2) / (lag2 + 0.0001) * 0.3 : 0;
+        return emaTrend * 0.4 + momTrend * 0.4 + priceTrend * 0.2;
+    }
+
+    private computeVolatility(priceHistory: readonly number[]): number {
+        if (priceHistory.length < 3) return 0;
+        const recent = priceHistory.slice(-FeatureExtractor.VOL_WINDOW);
+        const mean = recent.reduce((a, b) => a + b, 0) / recent.length;
+        const variance = recent.reduce((sum, p) => sum + (p - mean) ** 2, 0) / recent.length;
+        return Math.sqrt(variance);
+    }
+
+    /** Must be called AFTER extract() so that the current observation's EMA is not used for its own trend. */
+    updateEMA(price: number): void {
+        if (this.emaShort === 0.5 && this.emaLong === 0.5) {
+            this.emaShort = price;
+            this.emaLong = price;
+        } else {
+            this.emaShort = FeatureExtractor.ALPHA_SHORT * price + (1 - FeatureExtractor.ALPHA_SHORT) * this.emaShort;
+            this.emaLong = FeatureExtractor.ALPHA_LONG * price + (1 - FeatureExtractor.ALPHA_LONG) * this.emaLong;
+        }
+    }
+
+    /** Must be called BEFORE extract() so that normalization uses up-to-date statistics. */
+    updateStatistics(priceHistory: readonly number[]): void {
+        if (priceHistory.length === 0) return;
+        this.priceMean = priceHistory.reduce((a, b) => a + b, 0) / priceHistory.length;
+        const variance = priceHistory.reduce((sum, p) => sum + (p - this.priceMean) ** 2, 0) / priceHistory.length;
+        this.priceStd = Math.sqrt(variance);
+        if (this.priceStd < 0.001) this.priceStd = 0.1;
+    }
+
+    normalizePrice(price: number): number {
+        const z = (price - this.priceMean) / this.priceStd;
+        return clamp((z + 3) / 6, 0, 1);
+    }
+
+    denormalizePrice(normalized: number): number {
+        return (normalized * 6 - 3) * this.priceStd + this.priceMean;
+    }
+
+    // ── Microstructure feature computations ──
+    // Each returns a neutral value when the snapshot field is unavailable,
+    // so the model degrades gracefully to legacy behavior.
+
+    /**
+     * Spread: ask - bid, normalized to [0, 1].
+     * Wider spread = less liquidity, more uncertainty.
+     * Cap at 0.5 (50 cents on a [0,1] market) — beyond that is degenerate.
+     */
+    private computeSpread(snap: MarketSnapshot | null): number {
+        if (!snap || snap.spread === null) return 0;
+        return clamp(snap.spread / 0.5, 0, 1);
+    }
+
+    /**
+     * Microprice: size-weighted fair value.
+     * microprice = (bid * askSize + ask * bidSize) / (bidSize + askSize)
+     * Better than mid when the book is asymmetric. Falls back to mid, then 0.5.
+     * Output is normalized to [0, 1] using the same z-score as price lags.
+     */
+    private computeMicroprice(snap: MarketSnapshot | null): number {
+        if (!snap) return 0.5;
+
+        let rawMicroprice: number;
+        if (snap.bidSize !== null && snap.askSize !== null &&
+            snap.bestBid !== null && snap.bestAsk > 0 &&
+            (snap.bidSize + snap.askSize) > 0) {
+            rawMicroprice = (snap.bestBid * snap.askSize + snap.bestAsk * snap.bidSize)
+                            / (snap.bidSize + snap.askSize);
+        } else if (snap.mid !== null) {
+            rawMicroprice = snap.mid;
+        } else {
+            return 0.5;
+        }
+
+        return this.normalizePrice(rawMicroprice);
+    }
+
+    /**
+     * Book imbalance: (bidSize - askSize) / (bidSize + askSize).
+     * Positive = buy pressure (more resting bids). [-1, 1] naturally.
+     * Neutral (0) when sizes are unavailable.
+     */
+    private computeBookImbalance(snap: MarketSnapshot | null): number {
+        if (!snap || snap.bidSize === null || snap.askSize === null) return 0;
+        const total = snap.bidSize + snap.askSize;
+        if (total <= 0) return 0;
+        return clamp((snap.bidSize - snap.askSize) / total, -1, 1);
+    }
+
+    /**
+     * Down-ask delta: upAsk - (1 - downAsk).
+     * In a perfect market upAsk + downAsk = 1, so delta = 0.
+     * Non-zero means cross-leg mispricing / arbitrage pressure.
+     * Normalized by dividing by 0.1 (typical max deviation) and clamped to [-1, 1].
+     */
+    private computeDownAskDelta(snap: MarketSnapshot | null): number {
+        if (!snap || snap.downAsk === null) return 0;
+        const fairUp = 1 - snap.downAsk;
+        const delta = snap.bestAsk - fairUp;
+        return clamp(delta / 0.1, -1, 1);
+    }
+
+    /**
+     * Time remaining: fraction of the 5-minute round that has elapsed.
+     * 0 = just started, 1 = about to expire.
+     * As expiry approaches, prices converge to 0 or 1.
+     */
+    private computeTimeRemaining(snap: MarketSnapshot | null): number {
+        if (!snap || snap.roundStartTime === null) return 0.5;
+        const elapsed = snap.timestamp - snap.roundStartTime;
+        return clamp(elapsed / FeatureExtractor.ROUND_DURATION_MS, 0, 1);
+    }
+
+    /**
+     * Must be called on EVERY accepted price update (before the pole gate)
+     * so the EMA tracks actual WS quote arrival rate, not pole frequency.
+     */
+    trackQuoteArrival(snap: MarketSnapshot): void {
+        const now = snap.timestamp;
+        if (this.lastQuoteTimestamp !== null) {
+            const dtSec = Math.max(0.001, (now - this.lastQuoteTimestamp) / 1000);
+            const instantRate = 1 / dtSec;
+            this.quoteEma = FeatureExtractor.QUOTE_EMA_ALPHA * instantRate
+                          + (1 - FeatureExtractor.QUOTE_EMA_ALPHA) * this.quoteEma;
+        }
+        this.lastQuoteTimestamp = now;
+    }
+
+    /**
+     * Quote intensity: returns the pre-computed EMA of quote update rate.
+     * Normalized: raw rate / 10 (cap at 10 updates/sec), clamped to [0, 1].
+     */
+    private computeQuoteIntensity(): number {
+        return clamp(this.quoteEma / 10, 0, 1);
+    }
+
+    reset(): void {
+        this.emaShort = 0.5;
+        this.emaLong = 0.5;
+        this.quoteEma = 0;
+        this.lastQuoteTimestamp = null;
+        // priceMean / priceStd intentionally preserved — serve as priors for the next cycle
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EdgeCalculator
+// Stateless — converts model output into a tradable decision.
+//
+// Pipeline:
+//   predictedPrice → sigmoid(delta) → pUp/pDown
+//   pUp/pDown + askPrices + cost → edge per side
+//   best edge vs threshold → signal
+//
+// Replaces the former ConfidenceScorer (~130 lines of heuristics) and
+// SignalGenerator (~110 lines of cascading tiers) with ~70 lines of
+// principled edge-based logic.
+// ═══════════════════════════════════════════════════════════════════════════
+
+interface EdgeDecision {
+    pUp: number;
+    pDown: number;
+    edgeBuyUp: number;
+    edgeBuyDown: number;
+    direction: "up" | "down";
+    confidence: number;
+    signal: "BUY_UP" | "BUY_DOWN" | "HOLD";
+    rawScore: number;
+}
+
+class EdgeCalculator {
+    // How aggressively predicted price moves map to extreme probabilities.
+    // At SENSITIVITY=15: a 0.05 move → ~68%, a 0.10 move → ~82%.
+    private static readonly SIGMOID_SENSITIVITY = 15;
+
+    // Fixed cost component per share (slippage + protocol fees).
+    // Conservative: accounts for market impact + Polymarket taker fee.
+    private static readonly FIXED_COST = 0.008;
+
+    // Default half-spread assumption when actual spread is unavailable.
+    private static readonly DEFAULT_HALF_SPREAD = 0.008;
+
+    // Minimum net edge (after cost) required to emit a trade signal.
+    // Raised from 0.02 to 0.03 for safety — only trade when edge is convincing.
+    private static readonly MIN_EDGE = 0.03;
+
+    // Volatility above this level → force HOLD regardless of edge.
+    // Lowered from 0.12 to 0.08 for safety — avoid chaotic price action.
+    private static readonly VOL_CIRCUIT_BREAKER = 0.08;
+
+    // Maximum allowed spread to trade (above this, market is too illiquid).
+    private static readonly MAX_SPREAD_TO_TRADE = 0.06;
+
+    // Minimum resolved predictions before trading is allowed (warm-up gate).
+    private static readonly WARMUP_MIN_RESOLVED = 5;
+
+    compute(params: {
+        predictedPrice: number;
+        currentPrice: number;
+        rawScore: number;
+        features: FeatureVector;
+        snapshot: MarketSnapshot | null;
+        recentAccuracy: number;
+        resolvedCount: number;
+    }): EdgeDecision {
+        const { predictedPrice, currentPrice, rawScore, features, snapshot, recentAccuracy, resolvedCount } = params;
+
+        // ── 1. Predicted move → probability via sigmoid ──
+        // pUp = estimated probability that the UP token is worth buying
+        // (i.e., "the token's fair value is higher than its ask price")
+        const delta = predictedPrice - currentPrice;
+        const pUp = 1 / (1 + Math.exp(-EdgeCalculator.SIGMOID_SENSITIVITY * delta));
+        const pDown = 1 - pUp;
+
+        // ── 2. Execution cost estimate ──
+        const halfSpread = snapshot?.spread !== null && snapshot?.spread !== undefined
+            ? snapshot.spread / 2
+            : EdgeCalculator.DEFAULT_HALF_SPREAD;
+        const costPerShare = Math.max(0, halfSpread) + EdgeCalculator.FIXED_COST;
+
+        // ── 3. Edge per side ──
+        // Edge = P(token resolves favorably) − ask price − execution cost.
+        // For a binary market token at ask A with estimated fair probability p:
+        //   expected profit = p × 1 + (1−p) × 0 − A − cost = p − A − cost.
+        const upAsk = snapshot?.bestAsk ?? currentPrice;
+        const downAsk = snapshot?.downAsk ?? (1 - currentPrice);
+        const edgeBuyUp = pUp - upAsk - costPerShare;
+        const edgeBuyDown = pDown - downAsk - costPerShare;
+
+        // ── 4. Direction = side with better edge ──
+        const direction: "up" | "down" = edgeBuyUp >= edgeBuyDown ? "up" : "down";
+        const bestEdge = Math.max(edgeBuyUp, edgeBuyDown);
+
+        // ── 5. Confidence = P(correct direction) ──
+        const confidence = direction === "up" ? pUp : pDown;
+
+        // ── 6. Accuracy discount: scale effective edge when model is underperforming ──
+        const accuracyFactor = recentAccuracy >= 0.5 ? 1.0 : 0.5 + recentAccuracy;
+        const adjustedEdge = bestEdge * accuracyFactor;
+
+        // ── 7. Signal gating — multiple safety layers ──
+        let signal: "BUY_UP" | "BUY_DOWN" | "HOLD";
+
+        if (resolvedCount < EdgeCalculator.WARMUP_MIN_RESOLVED) {
+            // Not enough validated predictions yet — refuse to trade.
+            signal = "HOLD";
+        } else if (features.volatility > EdgeCalculator.VOL_CIRCUIT_BREAKER) {
+            signal = "HOLD";
+        } else if (snapshot?.spread !== null && snapshot?.spread !== undefined &&
+                   snapshot.spread > EdgeCalculator.MAX_SPREAD_TO_TRADE) {
+            // Spread too wide — market too illiquid, high execution risk.
+            signal = "HOLD";
+        } else if (adjustedEdge >= EdgeCalculator.MIN_EDGE) {
+            signal = direction === "up" ? "BUY_UP" : "BUY_DOWN";
+        } else {
+            signal = "HOLD";
+        }
+
+        return { pUp, pDown, edgeBuyUp, edgeBuyDown, direction, confidence, signal, rawScore };
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AdaptivePricePredictor (Orchestrator)
+// Owns the price buffer, noise filter, stability tracker, model weights,
+// and accuracy history. Delegates to the four components above.
+// ═══════════════════════════════════════════════════════════════════════════
+
+export class AdaptivePricePredictor {
+    // ── Price buffer ──
+    private priceHistory: number[] = [];
+    private timestamps: number[] = [];
+    private static readonly MAX_HISTORY = 10;
+
+    // ── Noise filtering ──
+    private static readonly NOISE_THRESHOLD = 0.02;
+    private static readonly SMOOTHING_ALPHA = 0.5;
+    private static readonly MIN_PRICE = 0.003;
+    private static readonly MAX_PRICE = 0.97;
+    private smoothedPrice: number | null = null;
+    private lastAddedPrice: number | null = null;
+    private lastRawPrice: number | null = null;
+
+    // ── Warm-up gate: refuse to trade until enough predictions are evaluated ──
+    private static readonly WARMUP_MIN_PREDICTIONS = 5;
+
+    // ── Model ──
+    // TODO: extract into a dedicated OnlineLinearModel class
+    private weights: ModelWeights = {
+        intercept: 0.5,
+        // Legacy
+        priceLag1: 0.25,
+        priceLag2: 0.08,
+        priceLag3: 0.04,
+        momentum: 0.35,
+        volatility: -0.20,
+        trend: 0.45,
+        // Microstructure — zero initial weights: no behavior change until online learner discovers signal
+        spread: 0,
+        microprice: 0,
+        bookImbalance: 0,
+        downAskDelta: 0,
+        timeRemaining: 0,
+        quoteIntensity: 0,
+    };
+    private static readonly LEARNING_RATE = 0.05;
+    private static readonly MIN_LR = 0.005;
+    private static readonly MAX_LR = 0.2;
+
+    // ── Accuracy tracking ──
     private predictionCount = 0;
     private correctPredictions = 0;
-    
-    // Recent accuracy tracking (sliding window for better adaptation)
-    private recentPredictions: Array<{ correct: boolean; confidence: number }> = [];
-    private readonly recentWindowSize = 20; // Track last 20 predictions
-    
-    // EMA for trend - using shorter periods for faster response
-    private emaShort = 0.5; // Fast EMA (2 periods) - faster response
-    private emaLong = 0.5; // Slow EMA (5 periods) - medium response
-    private readonly alphaShort = 2 / (2 + 1); // Faster EMA
-    private readonly alphaLong = 2 / (5 + 1); // Medium EMA
-    
-    // Pole detection (peaks and troughs) - only predict at pole values
-    private poleHistory: Array<{ price: number; type: "peak" | "trough"; timestamp: number }> = [];
-    private lastPolePrice: number | null = null;
-    private lastPoleType: "peak" | "trough" | null = null;
-    private lastPrediction: PricePrediction | null = null;
-    private lastPredictionFeatures: {
-        priceLag1: number; priceLag2: number; priceLag3: number;
-        momentum: number; volatility: number; trend: number;
-    } | null = null;
-    
-    // Price range limits - stop predictions outside this range
-    private readonly minPrice = 0.003; // Stop predictions if price < 0.003
-    private readonly maxPrice = 0.97; // Stop predictions if price > 0.97
-    
+    private recentPredictions: AccuracyRecord[] = [];
+    private static readonly RECENT_WINDOW = 20;
+
+    // ── Pending prediction (awaiting future outcome for learning) ──
+    private pending: PendingPrediction | null = null;
+
+    // ── Components ──
+    private readonly poles = new PoleDetector();
+    private readonly extractor = new FeatureExtractor();
+    private readonly edge = new EdgeCalculator();
+    private readonly diagnostics = new PredictionDiagnostics();
+
+    // ─────────────────────────────────────────────────────────────────────
+
     /**
-     * Update predictor with new price
-     * Returns prediction for next price
+     * Legacy entry point — accepts a single price scalar.
+     * Constructs a minimal MarketSnapshot and delegates to the full method.
      */
     public updateAndPredict(price: number, timestamp: number): PricePrediction | null {
-        const startTime = Date.now();
-        
-        // CRITICAL: Stop predictions if price is outside valid range (0.003 to 0.97)
-        if (price < this.minPrice || price > this.maxPrice) {
-            // Price outside valid range - stop predictions until next market
-            // Predictions will resume when reset() is called (new market cycle)
+        const minimalSnapshot: MarketSnapshot = {
+            bestAsk: price,
+            bestBid: null,
+            spread: null,
+            mid: null,
+            bidSize: null,
+            askSize: null,
+            downAsk: null,
+            timestamp,
+            roundStartTime: null,
+        };
+        return this.updateAndPredictWithSnapshot(minimalSnapshot);
+    }
+
+    /**
+     * Rich entry point — accepts a full MarketSnapshot with orderbook + timing data.
+     * The primary price used for the model is always `snapshot.bestAsk` (UP token ask).
+     */
+    public updateAndPredictWithSnapshot(snapshot: MarketSnapshot): PricePrediction | null {
+        const t0 = Date.now();
+        const price = snapshot.bestAsk;
+        const timestamp = snapshot.timestamp;
+
+        // ── Gate: price range ──
+        if (price < AdaptivePricePredictor.MIN_PRICE || price > AdaptivePricePredictor.MAX_PRICE) {
             return null;
         }
-        
-        // Apply noise filtering: smooth the price first
+
+        // ── Gate: first price (initialization) ──
         if (this.smoothedPrice === null) {
-            // Initialize with first price
             this.smoothedPrice = price;
             this.lastAddedPrice = price;
             this.priceHistory.push(price);
             this.timestamps.push(timestamp);
-            // Return null - not enough data for prediction yet
             return null;
         }
-        
-        // Check ACTUAL price change first (before smoothing) - use raw price for threshold check
-        const actualPriceChange = this.lastAddedPrice !== null 
-            ? Math.abs(price - this.lastAddedPrice)
-            : 0;
-        
-        // CRITICAL: Filter only changes UNDER 0.02 (strictly < 0.02)
-        // Changes >= 0.02 should be considered for prediction
-        if (this.lastAddedPrice !== null && actualPriceChange < this.noiseThreshold) {
-            // Price change too small (< 0.02) - ignore completely, don't make prediction, don't add to history
+
+        // ── Gate: noise filter ──
+        // Compare raw price to previous raw price (not smoothed) for consistent filtering.
+        if (this.lastRawPrice !== null &&
+            Math.abs(price - this.lastRawPrice) < AdaptivePricePredictor.NOISE_THRESHOLD) {
             return null;
         }
-        
-        // Update smoothed price using EMA (only if change is significant)
-        this.smoothedPrice = this.smoothingAlpha * price + (1 - this.smoothingAlpha) * (this.smoothedPrice ?? price);
-        
-        // Also check smoothed price is in valid range
-        if (this.smoothedPrice < this.minPrice || this.smoothedPrice > this.maxPrice) {
+        this.lastRawPrice = price;
+
+        // ── Smooth ──
+        this.smoothedPrice =
+            AdaptivePricePredictor.SMOOTHING_ALPHA * price +
+            (1 - AdaptivePricePredictor.SMOOTHING_ALPHA) * this.smoothedPrice;
+
+        if (this.smoothedPrice < AdaptivePricePredictor.MIN_PRICE ||
+            this.smoothedPrice > AdaptivePricePredictor.MAX_PRICE) {
             return null;
         }
-        
-        // Use smoothed price change for further processing (but threshold already checked with raw price)
-        const smoothedPriceChange = Math.abs(this.smoothedPrice - (this.lastAddedPrice ?? this.smoothedPrice));
-        
-        // Only process if change is significant (>= 0.02)
-        // Detect stability (using smoothed change for stability detection)
-        const isStable = smoothedPriceChange < this.noiseThreshold;
-        
-        if (isStable) {
-            this.stablePriceCount++;
-            if (this.lastStablePrice !== null && Math.abs(this.smoothedPrice - this.lastStablePrice) < 0.001) {
-                // Price is completely stable
-            } else {
-                this.lastStablePrice = this.smoothedPrice;
-            }
-        } else {
-            this.stablePriceCount = 0;
-            this.lastStablePrice = null;
-        }
-        
-        // Add to history (change is significant >= 0.02)
-        this.priceHistory.push(this.smoothedPrice);
+
+        const currentPrice = this.smoothedPrice;
+
+        // ── Track quote intensity on every accepted update (before pole gate) ──
+        this.extractor.trackQuoteArrival(snapshot);
+
+        // ── Buffer update ──
+        this.priceHistory.push(currentPrice);
         this.timestamps.push(timestamp);
-        this.lastAddedPrice = this.smoothedPrice;
-        
-        // Maintain history size
-        if (this.priceHistory.length > this.maxHistorySize) {
+        this.lastAddedPrice = currentPrice;
+
+        if (this.priceHistory.length > AdaptivePricePredictor.MAX_HISTORY) {
             this.priceHistory.shift();
             this.timestamps.shift();
         }
-        
-        // Need at least 3 prices for prediction
-        if (this.priceHistory.length < 3) {
-            return null; // Not enough data
-        }
-        
-        // Use smoothed price for all calculations
-        const currentSmoothedPrice = this.smoothedPrice ?? price;
-        
-        // CRITICAL: Only make predictions at pole values (peaks and troughs)
-        const isPole = this.detectPole(currentSmoothedPrice, timestamp);
-        
-        // If not at a pole, return null - NO PREDICTION
-        if (!isPole) {
+
+        // ── Gate: minimum history ──
+        if (this.priceHistory.length < 3) return null;
+
+        // ── Gate: pole detection ──
+        if (!this.poles.detect(this.priceHistory, timestamp, AdaptivePricePredictor.NOISE_THRESHOLD)) {
             return null;
         }
-        
-        // Update statistics
-        this.updateStatistics();
-        
-        const features = this.calculateFeatures();
-        this.lastPredictionFeatures = features;
 
-        const predictedPrice = this.predictPrice(features);
-        
-        // Update EMA with smoothed price
-        this.updateEMA(currentSmoothedPrice);
-        
-        // Learn from previous prediction if we have enough history
-        if (this.priceHistory.length >= 4) {
-            this.learnFromPreviousPrediction();
-        }
-        
+        // ══════════════════════════════════════════════════════════════════
+        // LEARNING LIFECYCLE (correct timing):
+        //
+        //   Pole T:   features_T extracted → predict(features_T) → store as pending
+        //   Pole T+1: currentPrice arrives → learnFromPending(currentPrice)
+        //                                    (evaluates T's prediction against T+1's outcome)
+        //             → features_T+1 extracted → predict(features_T+1) → store as pending
+        //
+        // This ensures:
+        //   - Features used for learning were computed BEFORE the outcome was known
+        //   - The predicted price being evaluated was computed BEFORE the outcome
+        //   - No current-bar information leaks into the training of its own prediction
+        // ══════════════════════════════════════════════════════════════════
+
+        // ── Step 1: Learn from previous prediction using current price as outcome ──
+        this.learnFromPending(currentPrice);
+
+        // ── Step 2: Extract features for current prediction ──
+        this.extractor.updateStatistics(this.priceHistory);
+        const features = this.extractor.extractWithSnapshot(this.priceHistory, snapshot);
+
+        // ── Step 3: Predict (weights may have just been updated by learning) ──
+        const { predictedPrice, rawScore } = this.predict(features);
+
+        // ── Step 4: Update EMA for next call's trend calculation ──
+        this.extractor.updateEMA(currentPrice);
+
+        // ── Step 5: Edge-based decision ──
         const recentAccuracy = this.getRecentAccuracy();
-        const confidence = this.calculateConfidence(features, predictedPrice, currentSmoothedPrice, recentAccuracy);
-
-        const direction = this.getDirection(predictedPrice, currentSmoothedPrice, features);
-
-        const signal = this.generateSignal(direction, confidence, features, recentAccuracy);
-        
-        const elapsed = Date.now() - startTime;
-        if (elapsed > 20) {
-            logger.error(`Price prediction took ${elapsed}ms (exceeds 20ms limit)`);
-        }
-        
-        const prediction: PricePrediction = {
+        const decision = this.edge.compute({
             predictedPrice,
-            confidence,
-            direction,
-            signal,
-            isPoleValue: isPole,
+            currentPrice,
+            rawScore,
+            features,
+            snapshot,
+            recentAccuracy,
+            resolvedCount: this.recentPredictions.length,
+        });
+
+        // ── Step 6: Store current prediction as pending ──
+        this.pending = {
+            features,
+            predictedPrice,
+            basePrice: currentPrice,
+            confidence: decision.confidence,
+        };
+
+        // ── Build result ──
+        const result: PricePrediction = {
+            predictedPrice,
+            confidence: decision.confidence,
+            direction: decision.direction,
+            signal: decision.signal,
+            isPoleValue: true,
             features: {
                 momentum: features.momentum,
                 volatility: features.volatility,
                 trend: features.trend,
             },
+            pUp: decision.pUp,
+            pDown: decision.pDown,
+            edgeBuyUp: decision.edgeBuyUp,
+            edgeBuyDown: decision.edgeBuyDown,
+            rawScore: decision.rawScore,
         };
-        
-        // Store prediction for reuse when not at pole
-        this.lastPrediction = prediction;
-        
-        return prediction;
-    }
-    
-    private recordPole(price: number, type: "peak" | "trough", timestamp: number): void {
-        this.lastPolePrice = price;
-        this.lastPoleType = type;
-        this.poleHistory.push({ price, type, timestamp });
-        if (this.poleHistory.length > 10) this.poleHistory.shift();
-    }
 
-    private detectPole(currentPrice: number, timestamp: number): boolean {
-        // Need at least 3 prices to detect a pole
-        if (this.priceHistory.length < 3) {
-            return false;
-        }
-        
-        const n = this.priceHistory.length;
-        const centerIdx = n - 1; // Current price is at the end
-        const centerPrice = this.priceHistory[centerIdx];
-        
-        // Check if current price is a local peak (higher than previous prices)
-        // or trough (lower than previous prices)
-        if (centerIdx >= 2) {
-            let isPeak = true;
-            let isTrough = true;
-            
-            // Check at least 2 previous prices
-            const lookback = Math.min(3, centerIdx);
-            for (let i = centerIdx - lookback; i < centerIdx; i++) {
-                const price = this.priceHistory[i];
-                // For peak: all previous prices must be strictly lower
-                if (price >= centerPrice) isPeak = false;
-                // For trough: all previous prices must be strictly higher
-                if (price <= centerPrice) isTrough = false;
-            }
-            
-            // Check if this is a pole (peak or trough)
-            if (isPeak || isTrough) {
-                // Check if change from last pole is significant (> 0.019)
-                if (this.lastPolePrice === null) {
-                    // First pole - always accept
-                    this.recordPole(centerPrice, isPeak ? "peak" : "trough", timestamp);
-                    return true;
-                } else {
-                    const changeFromLastPole = Math.abs(centerPrice - this.lastPolePrice);
-                    const isDifferentPoleType = (isPeak && this.lastPoleType === "trough") ||
-                                                (isTrough && this.lastPoleType === "peak");
+        // ── Step 7: Record for diagnostics ──
+        this.diagnostics.record(result, snapshot, currentPrice);
 
-                    if (changeFromLastPole >= this.noiseThreshold || isDifferentPoleType) {
-                        this.recordPole(centerPrice, isPeak ? "peak" : "trough", timestamp);
-                        return true;
-                    }
-                    return false;
-                }
-            }
-        }
-        
-        return false; // Not at a pole
-    }
-    
-    /**
-     * Calculate features from price history
-     */
-    private calculateFeatures(): {
-        priceLag1: number;
-        priceLag2: number;
-        priceLag3: number;
-        momentum: number;
-        volatility: number;
-        trend: number;
-    } {
-        const n = this.priceHistory.length;
-        const currentPrice = this.priceHistory[n - 1];
-        const priceLag1 = n >= 2 ? this.priceHistory[n - 2] : currentPrice;
-        const priceLag2 = n >= 3 ? this.priceHistory[n - 3] : priceLag1;
-        const priceLag3 = n >= 4 ? this.priceHistory[n - 4] : priceLag2;
-
-        const shortMom = priceLag1 > 0 ? (currentPrice - priceLag1) / priceLag1 : 0;
-
-        let momentum = shortMom;
-        if (n >= 4) {
-            const longMom = (currentPrice - priceLag2) / (priceLag2 + 0.0001);
-            const sameSign = (shortMom > 0 && longMom > 0) || (shortMom < 0 && longMom < 0);
-            if (sameSign) {
-                momentum = (shortMom + longMom) / 2;
-            }
+        // ── Timing guard ──
+        const elapsed = Date.now() - t0;
+        if (elapsed > 20) {
+            logger.error(`Price prediction took ${elapsed}ms (exceeds 20ms limit)`);
         }
 
-        const emaTrend = this.emaShort - this.emaLong;
-        const momentumTrend = momentum * 0.5;
-        const priceChangeTrend = n >= 3 ? (currentPrice - priceLag2) / (priceLag2 + 0.0001) * 0.3 : 0;
-        const combinedTrend = emaTrend * 0.4 + momentumTrend * 0.4 + priceChangeTrend * 0.2;
-
-        return {
-            priceLag1: this.normalizePrice(priceLag1),
-            priceLag2: this.normalizePrice(priceLag2),
-            priceLag3: this.normalizePrice(priceLag3),
-            momentum: this.normalizeMomentum(momentum),
-            volatility: this.normalizeVolatility(this.calculateVolatility()),
-            trend: this.normalizeTrend(combinedTrend),
-        };
+        return result;
     }
-    
+
+    // ── Model ───────────────────────────────────────────────────────────
+
+    private predict(features: FeatureVector): { predictedPrice: number; rawScore: number } {
+        const w = this.weights;
+        const rawScore =
+            w.intercept +
+            // Legacy
+            w.priceLag1 * features.priceLag1 +
+            w.priceLag2 * features.priceLag2 +
+            w.priceLag3 * features.priceLag3 +
+            w.momentum  * features.momentum +
+            w.volatility * features.volatility +
+            w.trend     * features.trend +
+            // Microstructure
+            w.spread        * features.spread +
+            w.microprice    * features.microprice +
+            w.bookImbalance * features.bookImbalance +
+            w.downAskDelta  * features.downAskDelta +
+            w.timeRemaining * features.timeRemaining +
+            w.quoteIntensity * features.quoteIntensity;
+        return { predictedPrice: this.extractor.denormalizePrice(rawScore), rawScore };
+    }
+
     /**
-     * Calculate volatility from smoothed price history
+     * Evaluate the pending prediction against the realized outcome and update weights.
+     *
+     * Timing contract:
+     *   - At pole T, we made a prediction P_T with features F_T about price at base B_T.
+     *   - At pole T+1, outcomePrice is the new smoothed price.
+     *   - We evaluate: error = outcomePrice - P_T (price-space regression error)
+     *   - Direction: did price move from B_T toward P_T or away from it?
+     *   - Gradient uses F_T (frozen at prediction time), NOT current features.
+     *   - outcomePrice was NOT available when F_T was computed → no leakage.
+     *
+     * TODO: replace with proper regularized SGD or explore EWRLS
      */
-    private calculateVolatility(): number {
-        const n = this.priceHistory.length;
-        if (n < 3) return 0;
-        
-        const recentPrices = this.priceHistory.slice(-5);
-        const mean = recentPrices.reduce((a, b) => a + b, 0) / recentPrices.length;
-        const variance = recentPrices.reduce((sum, p) => sum + Math.pow(p - mean, 2), 0) / recentPrices.length;
-        return Math.sqrt(variance);
-    }
-    
-    /**
-     * Predict price using linear regression
-     */
-    private predictPrice(features: ReturnType<typeof this.calculateFeatures>): number {
-        const prediction = 
-            this.weights.intercept +
-            this.weights.priceLag1 * features.priceLag1 +
-            this.weights.priceLag2 * features.priceLag2 +
-            this.weights.priceLag3 * features.priceLag3 +
-            this.weights.momentum * features.momentum +
-            this.weights.volatility * features.volatility +
-            this.weights.trend * features.trend;
-        
-        // Denormalize
-        return this.denormalizePrice(prediction);
-    }
-    
-    private learnFromPreviousPrediction(): void {
-        if (this.priceHistory.length < 4 || !this.lastPredictionFeatures) return;
+    private learnFromPending(outcomePrice: number): void {
+        if (!this.pending) return;
 
-        const n = this.priceHistory.length;
-        const actualPrice = this.priceHistory[n - 1];
-        const previousPrice = this.priceHistory[n - 2];
+        const p = this.pending;
+        const f = p.features;
 
-        const prevFeatures = this.lastPredictionFeatures;
-        const predictedPrice = this.predictPrice(prevFeatures);
-        const error = actualPrice - predictedPrice;
+        // Error: how far off was the predicted price from the realized outcome?
+        const error = outcomePrice - p.predictedPrice;
+        const normError = Math.min(1, Math.abs(error) * 10);
 
-        const normalizedError = Math.min(1, Math.abs(error) * 10);
+        // Direction evaluation: relative to the price AT prediction time.
+        // "I predicted price would go from basePrice toward predictedPrice.
+        //  Did it actually go that way?"
+        const predDir = p.predictedPrice > p.basePrice ? 1 : (p.predictedPrice < p.basePrice ? -1 : 0);
+        const actDir  = outcomePrice > p.basePrice ? 1 : (outcomePrice < p.basePrice ? -1 : 0);
+        const wrong   = predDir !== actDir && predDir !== 0 && actDir !== 0;
+        const correct = predDir === actDir && predDir !== 0;
 
-        const predictedDir = predictedPrice > previousPrice ? 1 : (predictedPrice < previousPrice ? -1 : 0);
-        const actualDir = actualPrice > previousPrice ? 1 : (actualPrice < previousPrice ? -1 : 0);
-        const wasWrong = predictedDir !== actualDir && predictedDir !== 0 && actualDir !== 0;
-        const directionCorrect = predictedDir === actualDir && predictedDir !== 0;
-
-        const errorMultiplier = wasWrong ? 8.0 : 2.5;
-        const adaptiveLR = Math.max(
-            this.minLearningRate,
-            Math.min(this.maxLearningRate, this.learningRate * (1 + normalizedError * errorMultiplier)),
+        // Asymmetric learning: learn faster from mistakes
+        const mult = wrong ? 8.0 : 2.5;
+        const lr = clamp(
+            AdaptivePricePredictor.LEARNING_RATE * (1 + normError * mult),
+            AdaptivePricePredictor.MIN_LR,
+            AdaptivePricePredictor.MAX_LR,
         );
 
-        const decay = wasWrong ? 0.85 : 0.97;
-        this.weights.intercept  = this.weights.intercept  * decay + adaptiveLR * error;
-        this.weights.priceLag1  = this.weights.priceLag1  * decay + adaptiveLR * error * prevFeatures.priceLag1;
-        this.weights.priceLag2  = this.weights.priceLag2  * decay + adaptiveLR * error * prevFeatures.priceLag2;
-        this.weights.priceLag3  = this.weights.priceLag3  * decay + adaptiveLR * error * prevFeatures.priceLag3;
-        this.weights.momentum   = this.weights.momentum   * decay + adaptiveLR * error * prevFeatures.momentum;
-        this.weights.volatility = this.weights.volatility * decay + adaptiveLR * error * prevFeatures.volatility;
-        this.weights.trend      = this.weights.trend      * decay + adaptiveLR * error * prevFeatures.trend;
+        // TODO: weight decay should be a separate regularization strategy
+        const decay = wrong ? 0.85 : 0.97;
+        const grad = lr * error;
+        this.weights.intercept  = this.weights.intercept  * decay + grad;
+        // Legacy
+        this.weights.priceLag1  = this.weights.priceLag1  * decay + grad * f.priceLag1;
+        this.weights.priceLag2  = this.weights.priceLag2  * decay + grad * f.priceLag2;
+        this.weights.priceLag3  = this.weights.priceLag3  * decay + grad * f.priceLag3;
+        this.weights.momentum   = this.weights.momentum   * decay + grad * f.momentum;
+        this.weights.volatility = this.weights.volatility * decay + grad * f.volatility;
+        this.weights.trend      = this.weights.trend      * decay + grad * f.trend;
+        // Microstructure
+        this.weights.spread        = this.weights.spread        * decay + grad * f.spread;
+        this.weights.microprice    = this.weights.microprice    * decay + grad * f.microprice;
+        this.weights.bookImbalance = this.weights.bookImbalance * decay + grad * f.bookImbalance;
+        this.weights.downAskDelta  = this.weights.downAskDelta  * decay + grad * f.downAskDelta;
+        this.weights.timeRemaining = this.weights.timeRemaining * decay + grad * f.timeRemaining;
+        this.weights.quoteIntensity = this.weights.quoteIntensity * decay + grad * f.quoteIntensity;
 
+        // Track accuracy
         this.predictionCount++;
-        if (directionCorrect) this.correctPredictions++;
+        if (correct) this.correctPredictions++;
 
-        const lastConfidence = this.lastPrediction?.confidence ?? 0.5;
-        this.recentPredictions.push({ correct: directionCorrect, confidence: lastConfidence });
-        if (this.recentPredictions.length > this.recentWindowSize) {
+        this.recentPredictions.push({ correct, confidence: p.confidence });
+        if (this.recentPredictions.length > AdaptivePricePredictor.RECENT_WINDOW) {
             this.recentPredictions.shift();
         }
+
+        // Record outcome for diagnostics
+        this.diagnostics.resolve(outcomePrice, Date.now());
+
+        this.pending = null;
     }
-    
+
+    // ── Helpers ─────────────────────────────────────────────────────────
+
     private getRecentAccuracy(): number {
-        if (this.recentPredictions.length === 0) return 0.6;
-        const correct = this.recentPredictions.filter(p => p.correct).length;
-        return correct / this.recentPredictions.length;
+        // Cold-start: return 0.5 (coin-flip) — no phantom confidence.
+        // The warm-up gate in EdgeCalculator will force HOLD anyway until
+        // enough samples are collected to trust this value.
+        if (this.recentPredictions.length === 0) return 0.5;
+        return this.recentPredictions.filter(p => p.correct).length / this.recentPredictions.length;
     }
 
-    private calculateConfidence(
-        features: ReturnType<typeof this.calculateFeatures>,
-        predictedPrice: number,
-        currentPrice: number,
-        recentAccuracy: number,
-    ): number {
-        // Base confidence on:
-        // 1. Volatility (lower volatility = higher confidence)
-        // 2. Trend strength (stronger trend = higher confidence)
-        // 3. Momentum consistency
-        // 4. Prediction magnitude (larger predicted change = higher confidence if trend aligns)
-        
-        // IMPROVED: Based on analysis - lower volatility (0.086) vs wrong (0.093) correlates with success
-        // Apply MUCH stronger penalty for high volatility (> 0.08)
-        const volatilityPenalty = features.volatility > 0.08 ? 0.25 : (features.volatility > 0.06 ? 0.10 : 0); // Extra penalty for high volatility
-        const volatilityFactor = Math.max(0.20, 1 - features.volatility * 12 - volatilityPenalty); // Increased multiplier from 10 to 12
-        
-        // IMPROVED: Based on analysis - stronger trend (0.018) vs wrong (-0.009) correlates with success
-        const trendFactor = Math.min(1, Math.abs(features.trend) * 10); // INCREASED multiplier from 8 to 10
-        
-        // IMPROVED: Based on analysis - stronger momentum (0.006) vs wrong (-0.004) correlates with success
-        const momentumFactor = Math.min(1, Math.abs(features.momentum) * 4); // INCREASED multiplier from 3 to 4
-        
-        // Prediction magnitude factor - if prediction is significant and aligns with trend
-        // Only consider changes >= 0.02, ignore < 0.02
-        const predDiff = Math.abs(predictedPrice - currentPrice);
-        const predMagnitudeFactor = predDiff >= this.noiseThreshold 
-            ? Math.min(1, predDiff * 20) // Larger predicted change = higher confidence (only if >= 0.02)
-            : 0; // Ignore predictions with changes < 0.02
-        
-        // Momentum-direction alignment
-        const momentumAlignment = (features.momentum > 0 && predictedPrice > currentPrice) || 
-                                  (features.momentum < 0 && predictedPrice < currentPrice) ? 1.0 : 0.7;
-        
-        const overallAccuracy = this.predictionCount > 10
-            ? this.correctPredictions / this.predictionCount
-            : 0.6;
+    // ── Public API ──────────────────────────────────────────────────────
 
-        const accuracyRate = recentAccuracy * 0.6 + overallAccuracy * 0.4;
-        
-        // Stability penalty: reduce confidence if price has been stable for too long
-        let stabilityFactor = 1.0;
-        if (this.stablePriceCount > this.maxStableCount) {
-            // Price is very stable - reduce confidence significantly
-            stabilityFactor = Math.max(0.5, 1.0 - (this.stablePriceCount - this.maxStableCount) * 0.1);
-        } else if (this.stablePriceCount > 0) {
-            // Slightly reduce confidence for stable prices
-            stabilityFactor = 0.9;
-        }
-        
-        let confidence = (
-            volatilityFactor  * 0.12 +
-            trendFactor       * 0.31 +
-            momentumFactor    * 0.19 +
-            predMagnitudeFactor * 0.08 +
-            accuracyRate      * 0.21 +
-            momentumAlignment * 0.09
-        );
-        
-        // Apply overconfidence penalty if recent high-confidence predictions were wrong
-        if (this.recentPredictions.length >= 10) {
-            const highConfPredictions = this.recentPredictions.filter(p => p.confidence >= 0.80);
-            if (highConfPredictions.length >= 5) {
-                const highConfAccuracy = highConfPredictions.filter(p => p.correct).length / highConfPredictions.length;
-                // If high confidence predictions have low accuracy, we're overconfident
-                if (highConfAccuracy < 0.65) {
-                    // Reduce confidence more aggressively for overconfident model
-                    const overconfidencePenalty = 0.85 - (0.65 - highConfAccuracy) * 0.5; // Penalty up to 20%
-                    confidence *= Math.max(0.70, overconfidencePenalty);
-                }
-            }
-        }
-        
-        // Apply stability factor - more penalty for unstable prices
-        confidence *= Math.max(0.85, stabilityFactor); // More penalty for stability issues
-        
-        // IMPROVED: Based on analysis - require stronger trend/momentum signals for confidence boost
-        // Analysis shows successful predictions have avg trend 0.018 vs wrong -0.009
-        // Analysis shows successful predictions have avg momentum 0.006 vs wrong -0.004
-        const strongTrend = Math.abs(features.trend) > 0.015; // LOWERED threshold from 0.05 - analysis shows even small positive trends matter
-        const strongMomentum = Math.abs(features.momentum) > 0.005; // LOWERED threshold from 0.03 - analysis shows even small positive momentum matters
-        const aligned = (features.trend > 0 && features.momentum > 0) || (features.trend < 0 && features.momentum < 0);
-        
-        // IMPROVED: More aggressive boost for aligned strong signals (analysis shows this correlates with success)
-        if (strongTrend && strongMomentum && aligned && accuracyRate >= 0.55) {
-            // Strong aligned signals - increased boost based on analysis
-            const alignmentStrength = Math.min(1, (Math.abs(features.trend) + Math.abs(features.momentum)) * 6.0); // Increased from 5.0
-            confidence = Math.min(0.95, confidence * (1 + alignmentStrength * 0.40)); // INCREASED from 0.35 to 0.40
-        } else if ((strongTrend || strongMomentum) && accuracyRate >= 0.55) {
-            // Only one strong signal - moderate boost
-            confidence = Math.min(0.90, confidence * 1.15); // INCREASED from 1.10 to 1.15
-        }
-        
-        // ADDITIONAL: Penalize high volatility more aggressively (analysis shows lower vol = success)
-        if (features.volatility > 0.09) {
-            // Very high volatility reduces confidence significantly
-            confidence *= 0.80; // 20% penalty for very high volatility
-        } else if (features.volatility > 0.08) {
-            // High volatility reduces confidence
-            confidence *= 0.88; // 12% penalty for high volatility
-        } else if (features.volatility > 0.06) {
-            // Moderate volatility - slight penalty
-            confidence *= 0.95; // 5% penalty for moderate volatility
-        }
-        
-        // Boost confidence if prediction magnitude is large AND aligns with trend AND accuracy is good
-        if (predDiff >= 0.02 && aligned && accuracyRate >= 0.55) {
-            confidence = Math.min(0.95, confidence * 1.20); // Reduced boost, cap at 95%
-        }
-        
-        // Additional boost for very large predictions (>= 0.10) with alignment
-        if (predDiff >= 0.10 && aligned && accuracyRate >= 0.60) {
-            confidence = Math.min(0.95, confidence * 1.10); // Reduced boost, cap at 95%
-        }
-        
-        if (this.recentPredictions.length >= 10) {
-            const maxConfidence = Math.min(0.92, 0.60 + recentAccuracy * 0.32);
-            confidence = Math.min(maxConfidence, confidence);
-
-            if (recentAccuracy < 0.55) {
-                confidence = Math.min(0.75, confidence);
-            } else if (recentAccuracy < 0.60) {
-                confidence = Math.min(0.80, confidence);
-            } else if (recentAccuracy < 0.65) {
-                confidence = Math.min(0.85, confidence);
-            }
-        } else {
-            confidence = Math.min(0.85, confidence);
-        }
-        
-        // ABSOLUTE HARD CAP: Never allow confidence above 92% (100% confidence is often wrong)
-        confidence = Math.min(0.92, confidence);
-        
-        // STRICT PENALTY: If trend and momentum don't align, significantly reduce confidence
-        if ((features.trend > 0 && features.momentum < -0.03) || (features.trend < 0 && features.momentum > 0.03)) {
-            confidence = Math.max(0.35, confidence * 0.70); // Strong penalty for misalignment
-        }
-        
-        // Special case: if price is very stable, lower confidence significantly
-        if (this.stablePriceCount > this.maxStableCount * 2) {
-            confidence = Math.max(0.35, confidence * 0.65); // Strong penalty for very stable prices
-        }
-        
-        // CRITICAL: Don't allow minimum confidence to be too high - let weak signals be filtered out
-        // If confidence is below 55%, it's likely a weak signal - don't force it to 50%
-        return Math.max(0.40, Math.min(1, confidence)); // Lower minimum to allow filtering of weak signals
-    }
-    
-    private getDirection(
-        predictedPrice: number,
-        currentPrice: number,
-        features: ReturnType<typeof this.calculateFeatures>,
-    ): "up" | "down" {
-        const diff = predictedPrice - currentPrice;
-        const effectiveThreshold = this.stablePriceCount > this.maxStableCount
-            ? this.noiseThreshold * 2
-            : this.noiseThreshold;
-
-        if (Math.abs(diff) >= effectiveThreshold) {
-            const predDir = diff > 0 ? "up" : "down" as const;
-            const momentumAligned = (predDir === "up" && features.momentum > -0.01) ||
-                                    (predDir === "down" && features.momentum < 0.01);
-            const trendAligned = (predDir === "up" && features.trend > -0.01) ||
-                                 (predDir === "down" && features.trend < 0.01);
-
-            if (momentumAligned || trendAligned) return predDir;
-
-            if (features.trend > 0.001 || features.momentum > 0.001) return "up";
-            if (features.trend < -0.001 || features.momentum < -0.001) return "down";
-            return predDir;
-        }
-
-        if (features.trend > 0.001) return "up";
-        if (features.trend < -0.001) return "down";
-        if (features.momentum > 0.001) return "up";
-        if (features.momentum < -0.001) return "down";
-        if (this.lastPoleType === "peak") return "down";
-        if (this.lastPoleType === "trough") return "up";
-        return "up";
-    }
-    
-    private generateSignal(
-        direction: "up" | "down",
-        confidence: number,
-        features: ReturnType<typeof this.calculateFeatures>,
-        recentAccuracy: number,
-    ): "BUY_UP" | "BUY_DOWN" | "HOLD" {
-        const minConfidenceForTrade = recentAccuracy < 0.50 ? 0.65 : (recentAccuracy < 0.55 ? 0.60 : 0.55);
-        
-        // Very high confidence: trade if confidence >= 75% AND trend/momentum align
-        if (confidence >= 0.75) {
-            const strongTrend = Math.abs(features.trend) > 0.012;
-            const aligned = (direction === "up" && features.trend > 0.012 && features.momentum > -0.03) ||
-                           (direction === "down" && features.trend < -0.012 && features.momentum < 0.03);
-            const lowVolatility = features.volatility < 0.10; // More lenient volatility requirement
-            
-            if (strongTrend && aligned && lowVolatility) {
-                if (direction === "up") return "BUY_UP";
-                if (direction === "down") return "BUY_DOWN";
-            }
-        }
-        
-        // High confidence: require strong alignment (68-75%)
-        if (confidence >= 0.68) {
-            const strongTrend = Math.abs(features.trend) > 0.015;
-            const trendAligned = (direction === "up" && features.trend > 0.015) || 
-                                (direction === "down" && features.trend < -0.015);
-            const momentumAligned = (direction === "up" && features.momentum > -0.04) || 
-                                   (direction === "down" && features.momentum < 0.04);
-            const lowVolatility = features.volatility < 0.10;
-            
-            if (strongTrend && trendAligned && momentumAligned && lowVolatility) {
-                if (direction === "up") return "BUY_UP";
-                if (direction === "down") return "BUY_DOWN";
-            }
-        }
-        
-        // Medium-high confidence: require strong alignment (62-68%)
-        if (confidence >= 0.62) {
-            const strongTrend = Math.abs(features.trend) > 0.018;
-            const aligned = (direction === "up" && features.trend > 0.018 && features.momentum > -0.04) ||
-                           (direction === "down" && features.trend < -0.018 && features.momentum < 0.04);
-            const lowVolatility = features.volatility < 0.11;
-            
-            if (strongTrend && aligned && lowVolatility) {
-                if (direction === "up") return "BUY_UP";
-                if (direction === "down") return "BUY_DOWN";
-            }
-        }
-        
-        // Medium confidence: require good alignment (55-62%) - this is where most trades should happen
-        if (confidence >= minConfidenceForTrade) {
-            // For medium confidence, require strong trend OR strong momentum with alignment
-            // Trend is normalized to [-1, 1], so 0.15 = 15% of max range
-            const strongTrend = Math.abs(features.trend) > 0.12; // Strong trend threshold (12% normalized = 0.012 raw)
-            const goodMomentum = Math.abs(features.momentum) > 0.02; // Good momentum
-            const aligned = (direction === "up" && features.trend > 0.08 && features.momentum > -0.05) ||
-                           (direction === "down" && features.trend < -0.08 && features.momentum < 0.05);
-            const acceptableVolatility = features.volatility < 0.12;
-            
-            // Trade if: (strong trend AND aligned) OR (good momentum AND aligned AND acceptable volatility)
-            if ((strongTrend && aligned && acceptableVolatility) || 
-                (goodMomentum && aligned && acceptableVolatility && confidence >= 0.55)) {
-                if (direction === "up") return "BUY_UP";
-                if (direction === "down") return "BUY_DOWN";
-            }
-        }
-        
-        // Lower confidence (50-55%): Only trade if trend is VERY strong
-        if (confidence >= 0.50 && recentAccuracy >= 0.50) {
-            const veryStrongTrend = Math.abs(features.trend) > 0.15; // Very strong trend (15%+ normalized)
-            const aligned = (direction === "up" && features.trend > 0.12 && features.momentum > -0.05) ||
-                           (direction === "down" && features.trend < -0.12 && features.momentum < 0.05);
-            const acceptableVolatility = features.volatility < 0.11;
-            
-            if (veryStrongTrend && aligned && acceptableVolatility) {
-                if (direction === "up") return "BUY_UP";
-                if (direction === "down") return "BUY_DOWN";
-            }
-        }
-        
-        // Default: HOLD - don't trade on weak signals
-        return "HOLD";
-    }
-    
-    /**
-     * Update EMA
-     */
-    private updateEMA(price: number): void {
-        if (this.emaShort === 0.5 && this.emaLong === 0.5) {
-            // Initialize
-            this.emaShort = price;
-            this.emaLong = price;
-        } else {
-            this.emaShort = this.alphaShort * price + (1 - this.alphaShort) * this.emaShort;
-            this.emaLong = this.alphaLong * price + (1 - this.alphaLong) * this.emaLong;
-        }
-    }
-    
-    /**
-     * Update price statistics
-     */
-    private updateStatistics(): void {
-        if (this.priceHistory.length === 0) return;
-        
-        const prices = this.priceHistory;
-        this.priceMean = prices.reduce((a, b) => a + b, 0) / prices.length;
-        
-        const variance = prices.reduce((sum, p) => sum + Math.pow(p - this.priceMean, 2), 0) / prices.length;
-        this.priceStd = Math.sqrt(variance);
-        
-        // Prevent division by zero
-        if (this.priceStd < 0.001) {
-            this.priceStd = 0.1;
-        }
-    }
-    
-    /**
-     * Normalize price to [0, 1] range
-     */
-    private normalizePrice(price: number): number {
-        // Use z-score normalization with clipping
-        const normalized = (price - this.priceMean) / this.priceStd;
-        // Clip to reasonable range and scale to [0, 1]
-        return Math.max(0, Math.min(1, (normalized + 3) / 6));
-    }
-    
-    /**
-     * Denormalize price from [0, 1] range
-     */
-    private denormalizePrice(normalized: number): number {
-        // Reverse z-score normalization
-        const zScore = (normalized * 6) - 3;
-        return zScore * this.priceStd + this.priceMean;
-    }
-    
-    /**
-     * Normalize momentum
-     */
-    private normalizeMomentum(momentum: number): number {
-        // Clip momentum to reasonable range [-1, 1]
-        return Math.max(-1, Math.min(1, momentum));
-    }
-    
-    /**
-     * Normalize volatility
-     */
-    private normalizeVolatility(volatility: number): number {
-        // Normalize volatility to [0, 1] range
-        // Typical volatility for prediction markets is 0-0.2
-        return Math.min(1, volatility * 5);
-    }
-    
-    /**
-     * Normalize trend
-     */
-    private normalizeTrend(trend: number): number {
-        // Normalize trend to [-1, 1] range
-        return Math.max(-1, Math.min(1, trend * 10));
-    }
-    
-    /**
-     * Get prediction accuracy statistics
-     */
     public getAccuracyStats(): { accuracy: number; totalPredictions: number; correctPredictions: number } {
         return {
             accuracy: this.predictionCount > 0 ? this.correctPredictions / this.predictionCount : 0,
@@ -764,24 +878,22 @@ export class AdaptivePricePredictor {
             correctPredictions: this.correctPredictions,
         };
     }
-    
-    /**
-     * Reset predictor (for new market cycle)
-     */
+
+    public getDiagnostics(): PredictionDiagnostics {
+        return this.diagnostics;
+    }
+
     public reset(): void {
         this.priceHistory = [];
         this.timestamps = [];
-        this.emaShort = 0.5;
-        this.emaLong = 0.5;
         this.smoothedPrice = null;
         this.lastAddedPrice = null;
-        this.stablePriceCount = 0;
-        this.lastStablePrice = null;
-        this.poleHistory = [];
-        this.lastPolePrice = null;
-        this.lastPoleType = null;
-        this.lastPrediction = null;
-        this.lastPredictionFeatures = null;
+        this.lastRawPrice = null;
+        // Discard pending prediction — it belongs to the old market cycle
+        // and the outcome will never arrive in the new cycle.
+        this.pending = null;
+        this.poles.reset();
+        this.extractor.reset();
+        // Weights + accuracy tracking intentionally preserved across market cycles
     }
 }
-
