@@ -86,8 +86,11 @@ export class AdaptivePricePredictor {
     private poleHistory: Array<{ price: number; type: "peak" | "trough"; timestamp: number }> = [];
     private lastPolePrice: number | null = null;
     private lastPoleType: "peak" | "trough" | null = null;
-    private lastPrediction: PricePrediction | null = null; // Store last prediction for pole-based updates
-    private lastPoleTimestamp: number | null = null; // Track time since last pole for time-based features
+    private lastPrediction: PricePrediction | null = null;
+    private lastPredictionFeatures: {
+        priceLag1: number; priceLag2: number; priceLag3: number;
+        momentum: number; volatility: number; trend: number;
+    } | null = null;
     
     // Price range limits - stop predictions outside this range
     private readonly minPrice = 0.003; // Stop predictions if price < 0.003
@@ -187,10 +190,9 @@ export class AdaptivePricePredictor {
         // Update statistics
         this.updateStatistics();
         
-        // Calculate features
         const features = this.calculateFeatures();
-        
-        // Make prediction
+        this.lastPredictionFeatures = features;
+
         const predictedPrice = this.predictPrice(features);
         
         // Update EMA with smoothed price
@@ -201,14 +203,12 @@ export class AdaptivePricePredictor {
             this.learnFromPreviousPrediction();
         }
         
-        // Calculate confidence (use smoothed price)
-        const confidence = this.calculateConfidence(features, predictedPrice, currentSmoothedPrice);
-        
-        // Determine direction (compare predicted vs smoothed price) - no neutral, always up or down
-        const direction = this.getDirection(predictedPrice, currentSmoothedPrice);
-        
-        // Generate signal
-        const signal = this.generateSignal(direction, confidence, features);
+        const recentAccuracy = this.getRecentAccuracy();
+        const confidence = this.calculateConfidence(features, predictedPrice, currentSmoothedPrice, recentAccuracy);
+
+        const direction = this.getDirection(predictedPrice, currentSmoothedPrice, features);
+
+        const signal = this.generateSignal(direction, confidence, features, recentAccuracy);
         
         const elapsed = Date.now() - startTime;
         if (elapsed > 20) {
@@ -234,10 +234,13 @@ export class AdaptivePricePredictor {
         return prediction;
     }
     
-    /**
-     * Detect pole values (local peaks and troughs)
-     * Returns true if current price is at a pole (peak or trough)
-     */
+    private recordPole(price: number, type: "peak" | "trough", timestamp: number): void {
+        this.lastPolePrice = price;
+        this.lastPoleType = type;
+        this.poleHistory.push({ price, type, timestamp });
+        if (this.poleHistory.length > 10) this.poleHistory.shift();
+    }
+
     private detectPole(currentPrice: number, timestamp: number): boolean {
         // Need at least 3 prices to detect a pole
         if (this.priceHistory.length < 3) {
@@ -269,33 +272,17 @@ export class AdaptivePricePredictor {
                 // Check if change from last pole is significant (> 0.019)
                 if (this.lastPolePrice === null) {
                     // First pole - always accept
-                    this.lastPolePrice = centerPrice;
-                    this.lastPoleType = isPeak ? "peak" : "trough";
-                    this.lastPoleTimestamp = timestamp;
-                    this.poleHistory.push({ price: centerPrice, type: this.lastPoleType, timestamp });
-                    if (this.poleHistory.length > 10) {
-                        this.poleHistory.shift();
-                    }
+                    this.recordPole(centerPrice, isPeak ? "peak" : "trough", timestamp);
                     return true;
                 } else {
-                    // Check if change from last pole is significant (>= 0.02)
                     const changeFromLastPole = Math.abs(centerPrice - this.lastPolePrice);
-                    // Also check if this is a different type of pole (peak vs trough)
-                    const isDifferentPoleType = (isPeak && this.lastPoleType === "trough") || 
+                    const isDifferentPoleType = (isPeak && this.lastPoleType === "trough") ||
                                                 (isTrough && this.lastPoleType === "peak");
-                    
+
                     if (changeFromLastPole >= this.noiseThreshold || isDifferentPoleType) {
-                        // Significant change OR different pole type - this is a new pole
-                        this.lastPolePrice = centerPrice;
-                        this.lastPoleType = isPeak ? "peak" : "trough";
-                        this.lastPoleTimestamp = timestamp;
-                        this.poleHistory.push({ price: centerPrice, type: this.lastPoleType, timestamp });
-                        if (this.poleHistory.length > 10) {
-                            this.poleHistory.shift();
-                        }
+                        this.recordPole(centerPrice, isPeak ? "peak" : "trough", timestamp);
                         return true;
                     }
-                    // Change too small from last pole - not a new pole
                     return false;
                 }
             }
@@ -320,42 +307,23 @@ export class AdaptivePricePredictor {
         const priceLag1 = n >= 2 ? this.priceHistory[n - 2] : currentPrice;
         const priceLag2 = n >= 3 ? this.priceHistory[n - 3] : priceLag1;
         const priceLag3 = n >= 4 ? this.priceHistory[n - 4] : priceLag2;
-        
-        // Momentum: rate of price change (using smoothed prices, so already noise-filtered)
-        // Calculate momentum over longer period to reduce noise sensitivity
-        const priceChange = currentPrice - priceLag1;
-        const momentum = priceLag1 > 0 ? priceChange / priceLag1 : 0;
-        
-        // Additional momentum check: compare with earlier price for trend confirmation
+
+        const shortMom = priceLag1 > 0 ? (currentPrice - priceLag1) / priceLag1 : 0;
+
+        let momentum = shortMom;
         if (n >= 4) {
-            const longerTermChange = currentPrice - priceLag2;
-            // If short-term and long-term momentum agree, use average (stronger signal)
-            if ((priceChange > 0 && longerTermChange > 0) || (priceChange < 0 && longerTermChange < 0)) {
-                const avgMomentum = (momentum + (longerTermChange / (priceLag2 + 0.0001))) / 2;
-                // Use the stronger signal
-                // Calculate trend using multiple methods
-                const emaTrend = this.emaShort - this.emaLong;
-                const momentumTrend = avgMomentum * 0.5; // Scale momentum for trend
-                const priceChangeTrend = (currentPrice - priceLag2) / (priceLag2 + 0.0001) * 0.3; // Medium-term change
-                const combinedTrend = emaTrend * 0.4 + momentumTrend * 0.4 + priceChangeTrend * 0.2; // Weighted combination
-                
-                return {
-                    priceLag1: this.normalizePrice(priceLag1),
-                    priceLag2: this.normalizePrice(priceLag2),
-                    priceLag3: this.normalizePrice(priceLag3),
-                    momentum: this.normalizeMomentum(avgMomentum),
-                    volatility: this.normalizeVolatility(this.calculateVolatility()),
-                    trend: this.normalizeTrend(combinedTrend),
-                };
+            const longMom = (currentPrice - priceLag2) / (priceLag2 + 0.0001);
+            const sameSign = (shortMom > 0 && longMom > 0) || (shortMom < 0 && longMom < 0);
+            if (sameSign) {
+                momentum = (shortMom + longMom) / 2;
             }
         }
-        
-        // Calculate trend using multiple methods (even if momentum doesn't agree)
+
         const emaTrend = this.emaShort - this.emaLong;
-        const momentumTrend = momentum * 0.5; // Scale momentum for trend
+        const momentumTrend = momentum * 0.5;
         const priceChangeTrend = n >= 3 ? (currentPrice - priceLag2) / (priceLag2 + 0.0001) * 0.3 : 0;
         const combinedTrend = emaTrend * 0.4 + momentumTrend * 0.4 + priceChangeTrend * 0.2;
-        
+
         return {
             priceLag1: this.normalizePrice(priceLag1),
             priceLag2: this.normalizePrice(priceLag2),
@@ -396,80 +364,60 @@ export class AdaptivePricePredictor {
         return this.denormalizePrice(prediction);
     }
     
-    /**
-     * Learn from previous prediction using online gradient descent
-     */
     private learnFromPreviousPrediction(): void {
-        if (this.priceHistory.length < 4) return;
-        
+        if (this.priceHistory.length < 4 || !this.lastPredictionFeatures) return;
+
         const n = this.priceHistory.length;
         const actualPrice = this.priceHistory[n - 1];
         const previousPrice = this.priceHistory[n - 2];
-        
-        // Get features that were used for previous prediction
-        const prevFeatures = {
-            priceLag1: n >= 3 ? this.normalizePrice(this.priceHistory[n - 3]) : 0.5,
-            priceLag2: n >= 4 ? this.normalizePrice(this.priceHistory[n - 4]) : 0.5,
-            priceLag3: n >= 5 ? this.normalizePrice(this.priceHistory[n - 5]) : 0.5,
-            momentum: this.normalizeMomentum((previousPrice - (n >= 3 ? this.priceHistory[n - 3] : previousPrice)) / (previousPrice + 0.0001)),
-            volatility: 0.1, // Simplified
-            trend: 0, // Simplified
-        };
-        
+
+        const prevFeatures = this.lastPredictionFeatures;
         const predictedPrice = this.predictPrice(prevFeatures);
         const error = actualPrice - predictedPrice;
-        
-        // IMPROVED: More aggressive learning from mistakes
-        const errorMagnitude = Math.abs(error);
-        const normalizedError = Math.min(1, errorMagnitude * 10); // Normalize error to [0, 1]
-        
-        // Check if prediction was wrong (direction-wise) - calculate once
-        const predictedDirection = predictedPrice > previousPrice ? 1 : (predictedPrice < previousPrice ? -1 : 0);
-        const actualDirection = actualPrice > previousPrice ? 1 : (actualPrice < previousPrice ? -1 : 0);
-        const wasWrong = predictedDirection !== actualDirection && predictedDirection !== 0 && actualDirection !== 0;
-        const directionCorrect = predictedDirection === actualDirection && predictedDirection !== 0;
-        
-        // Higher learning rate for wrong predictions and larger errors
-        // Much more aggressive learning from mistakes - improved based on log analysis
-        const errorMultiplier = wasWrong ? 8.0 : 2.5; // Increased from 7.0 to 8.0 for wrong predictions
+
+        const normalizedError = Math.min(1, Math.abs(error) * 10);
+
+        const predictedDir = predictedPrice > previousPrice ? 1 : (predictedPrice < previousPrice ? -1 : 0);
+        const actualDir = actualPrice > previousPrice ? 1 : (actualPrice < previousPrice ? -1 : 0);
+        const wasWrong = predictedDir !== actualDir && predictedDir !== 0 && actualDir !== 0;
+        const directionCorrect = predictedDir === actualDir && predictedDir !== 0;
+
+        const errorMultiplier = wasWrong ? 8.0 : 2.5;
         const adaptiveLR = Math.max(
             this.minLearningRate,
-            Math.min(this.maxLearningRate, this.learningRate * (1 + normalizedError * errorMultiplier))
+            Math.min(this.maxLearningRate, this.learningRate * (1 + normalizedError * errorMultiplier)),
         );
-        
-        // Update weights using gradient descent - faster learning from mistakes
-        // More aggressive decay reduction for wrong predictions to learn faster
-        const decay = wasWrong ? 0.85 : 0.97; // Less decay (faster learning) when wrong - even more aggressive (0.88 → 0.85)
-        this.weights.intercept = this.weights.intercept * decay + adaptiveLR * error;
-        this.weights.priceLag1 = this.weights.priceLag1 * decay + adaptiveLR * error * prevFeatures.priceLag1;
-        this.weights.priceLag2 = this.weights.priceLag2 * decay + adaptiveLR * error * prevFeatures.priceLag2;
-        this.weights.priceLag3 = this.weights.priceLag3 * decay + adaptiveLR * error * prevFeatures.priceLag3;
-        this.weights.momentum = this.weights.momentum * decay + adaptiveLR * error * prevFeatures.momentum;
-        this.weights.volatility = this.weights.volatility * decay + adaptiveLR * error * (prevFeatures.volatility || 0.1);
-        this.weights.trend = this.weights.trend * decay + adaptiveLR * error * (prevFeatures.trend || 0);
-        
-        // Track prediction accuracy (improved logic)
+
+        const decay = wasWrong ? 0.85 : 0.97;
+        this.weights.intercept  = this.weights.intercept  * decay + adaptiveLR * error;
+        this.weights.priceLag1  = this.weights.priceLag1  * decay + adaptiveLR * error * prevFeatures.priceLag1;
+        this.weights.priceLag2  = this.weights.priceLag2  * decay + adaptiveLR * error * prevFeatures.priceLag2;
+        this.weights.priceLag3  = this.weights.priceLag3  * decay + adaptiveLR * error * prevFeatures.priceLag3;
+        this.weights.momentum   = this.weights.momentum   * decay + adaptiveLR * error * prevFeatures.momentum;
+        this.weights.volatility = this.weights.volatility * decay + adaptiveLR * error * prevFeatures.volatility;
+        this.weights.trend      = this.weights.trend      * decay + adaptiveLR * error * prevFeatures.trend;
+
         this.predictionCount++;
-        if (directionCorrect) {
-            this.correctPredictions++;
-        }
-        
-        // Track recent predictions for adaptive confidence adjustment
-        // Get the confidence from the last prediction if available
-        const lastConfidence = this.lastPrediction?.confidence || 0.5;
+        if (directionCorrect) this.correctPredictions++;
+
+        const lastConfidence = this.lastPrediction?.confidence ?? 0.5;
         this.recentPredictions.push({ correct: directionCorrect, confidence: lastConfidence });
         if (this.recentPredictions.length > this.recentWindowSize) {
-            this.recentPredictions.shift(); // Keep only recent window
+            this.recentPredictions.shift();
         }
     }
     
-    /**
-     * Calculate prediction confidence
-     */
+    private getRecentAccuracy(): number {
+        if (this.recentPredictions.length === 0) return 0.6;
+        const correct = this.recentPredictions.filter(p => p.correct).length;
+        return correct / this.recentPredictions.length;
+    }
+
     private calculateConfidence(
         features: ReturnType<typeof this.calculateFeatures>,
         predictedPrice: number,
-        currentPrice: number
+        currentPrice: number,
+        recentAccuracy: number,
     ): number {
         // Base confidence on:
         // 1. Volatility (lower volatility = higher confidence)
@@ -499,22 +447,10 @@ export class AdaptivePricePredictor {
         const momentumAlignment = (features.momentum > 0 && predictedPrice > currentPrice) || 
                                   (features.momentum < 0 && predictedPrice < currentPrice) ? 1.0 : 0.7;
         
-        // Historical accuracy (weighted more heavily if we have enough data)
-        const overallAccuracy = this.predictionCount > 10 
-            ? this.correctPredictions / this.predictionCount 
-            : 0.6; // Default to 60% if not enough data
-        
-        // Recent accuracy (more responsive to current performance)
-        let recentAccuracy = 0.6;
-        if (this.recentPredictions.length >= 10) {
-            const recentCorrect = this.recentPredictions.filter(p => p.correct).length;
-            recentAccuracy = recentCorrect / this.recentPredictions.length;
-        } else if (this.recentPredictions.length > 0) {
-            const recentCorrect = this.recentPredictions.filter(p => p.correct).length;
-            recentAccuracy = recentCorrect / this.recentPredictions.length;
-        }
-        
-        // Use weighted average: 60% recent, 40% overall (recent performance is more important)
+        const overallAccuracy = this.predictionCount > 10
+            ? this.correctPredictions / this.predictionCount
+            : 0.6;
+
         const accuracyRate = recentAccuracy * 0.6 + overallAccuracy * 0.4;
         
         // Stability penalty: reduce confidence if price has been stable for too long
@@ -527,16 +463,13 @@ export class AdaptivePricePredictor {
             stabilityFactor = 0.9;
         }
         
-        // IMPROVED: Based on log analysis - rebalanced weights for better calibration
-        // Key findings: Stronger trend/momentum and lower volatility correlate with success
-        // Adjusted weights to emphasize trend and momentum, penalize volatility more
         let confidence = (
-            volatilityFactor * 0.18 + // INCREASED - volatility matters more (lower vol = success)
-            trendFactor * 0.45 + // Trend is most reliable predictor
-            momentumFactor * 0.28 + // INCREASED - stronger momentum correlates with success
-            predMagnitudeFactor * 0.12 + // Larger predictions are more reliable
-            accuracyRate * 0.30 + // INCREASED - accuracy is critical for calibration
-            momentumAlignment * 0.12 // Alignment matters
+            volatilityFactor  * 0.12 +
+            trendFactor       * 0.31 +
+            momentumFactor    * 0.19 +
+            predMagnitudeFactor * 0.08 +
+            accuracyRate      * 0.21 +
+            momentumAlignment * 0.09
         );
         
         // Apply overconfidence penalty if recent high-confidence predictions were wrong
@@ -595,26 +528,19 @@ export class AdaptivePricePredictor {
             confidence = Math.min(0.95, confidence * 1.10); // Reduced boost, cap at 95%
         }
         
-        // CRITICAL: Prevent overconfidence (confidence = 1.00 is often wrong)
-        // Cap maximum confidence based on recent accuracy - MUCH more conservative
         if (this.recentPredictions.length >= 10) {
-            const recentAccuracy = this.recentPredictions.filter(p => p.correct).length / this.recentPredictions.length;
-            // Very conservative cap: max confidence = 0.60 + (recentAccuracy * 0.30)
-            // This ensures confidence never exceeds what recent performance justifies
-            const maxConfidence = Math.min(0.92, 0.60 + recentAccuracy * 0.32); // More conservative cap
+            const maxConfidence = Math.min(0.92, 0.60 + recentAccuracy * 0.32);
             confidence = Math.min(maxConfidence, confidence);
-            
-            // Additional penalty: if recent accuracy is below 60%, cap confidence even lower
+
             if (recentAccuracy < 0.55) {
-                confidence = Math.min(0.75, confidence); // Hard cap at 75% if accuracy is very low
+                confidence = Math.min(0.75, confidence);
             } else if (recentAccuracy < 0.60) {
-                confidence = Math.min(0.80, confidence); // Hard cap at 80% if accuracy is low
+                confidence = Math.min(0.80, confidence);
             } else if (recentAccuracy < 0.65) {
-                confidence = Math.min(0.85, confidence); // Hard cap at 85% if accuracy is moderate
+                confidence = Math.min(0.85, confidence);
             }
         } else {
-            // Default cap if not enough data - be very conservative early
-            confidence = Math.min(0.85, confidence); // Reduced from 0.90 to 0.85
+            confidence = Math.min(0.85, confidence);
         }
         
         // ABSOLUTE HARD CAP: Never allow confidence above 92% (100% confidence is often wrong)
@@ -635,99 +561,46 @@ export class AdaptivePricePredictor {
         return Math.max(0.40, Math.min(1, confidence)); // Lower minimum to allow filtering of weak signals
     }
     
-    /**
-     * Determine price direction - always returns "up" or "down", never "neutral"
-     * Ignores changes < 0.02, only considers changes >= 0.02
-     * neutral+up → up, neutral+down → down
-     */
-    private getDirection(predictedPrice: number, currentPrice: number): "up" | "down" {
+    private getDirection(
+        predictedPrice: number,
+        currentPrice: number,
+        features: ReturnType<typeof this.calculateFeatures>,
+    ): "up" | "down" {
         const diff = predictedPrice - currentPrice;
-        // Use threshold 0.02 - ignore changes < 0.02, consider changes >= 0.02
-        const minChangeThreshold = this.noiseThreshold; // Use noiseThreshold (0.02)
-        
-        // For stable prices, require even larger threshold
-        const effectiveThreshold = this.stablePriceCount > this.maxStableCount 
-            ? minChangeThreshold * 2  // Double threshold for stable prices
-            : minChangeThreshold;
-        
-        // Get features to check trend and momentum (needed for both cases)
-        const features = this.calculateFeatures();
-        
-        // Always return up or down based on prediction and trend/momentum, never neutral
-        // If change is significant (>= 0.02), use prediction; otherwise use trend/momentum
+        const effectiveThreshold = this.stablePriceCount > this.maxStableCount
+            ? this.noiseThreshold * 2
+            : this.noiseThreshold;
+
         if (Math.abs(diff) >= effectiveThreshold) {
-            // Significant change - use prediction, but verify with momentum/trend
-            const predictionDirection = diff > 0 ? "up" : "down";
-            
-            // If momentum aligns with prediction, trust prediction
-            const momentumAligned = (predictionDirection === "up" && features.momentum > -0.01) || 
-                                    (predictionDirection === "down" && features.momentum < 0.01);
-            
-            // If trend aligns with prediction, trust prediction
-            const trendAligned = (predictionDirection === "up" && features.trend > -0.01) || 
-                                (predictionDirection === "down" && features.trend < 0.01);
-            
-            // If both align, use prediction; otherwise, use trend/momentum
-            if (momentumAligned || trendAligned) {
-                return predictionDirection;
-            } else {
-                // Prediction doesn't align with momentum/trend - use trend/momentum instead
-                if (features.trend > 0.001 || features.momentum > 0.001) {
-                    return "up";
-                } else if (features.trend < -0.001 || features.momentum < -0.001) {
-                    return "down";
-                } else {
-                    // Fallback to prediction direction
-                    return predictionDirection;
-                }
-            }
-        } else {
-            // Change too small - use trend/momentum to determine direction
-            // Use trend to determine direction (neutral+up → up, neutral+down → down)
-            if (features.trend > 0.001) {
-                return "up"; // Upward trend
-            } else if (features.trend < -0.001) {
-                return "down"; // Downward trend
-            } else {
-                // No clear trend, use momentum
-                if (features.momentum > 0.001) {
-                    return "up"; // Positive momentum → up
-                } else if (features.momentum < -0.001) {
-                    return "down"; // Negative momentum → down
-                } else {
-                    // No clear signal - use last pole type or default
-                    if (this.lastPoleType === "peak") return "down"; // After peak, expect down
-                    if (this.lastPoleType === "trough") return "up"; // After trough, expect up
-                    return "up"; // Default to up
-                }
-            }
+            const predDir = diff > 0 ? "up" : "down" as const;
+            const momentumAligned = (predDir === "up" && features.momentum > -0.01) ||
+                                    (predDir === "down" && features.momentum < 0.01);
+            const trendAligned = (predDir === "up" && features.trend > -0.01) ||
+                                 (predDir === "down" && features.trend < 0.01);
+
+            if (momentumAligned || trendAligned) return predDir;
+
+            if (features.trend > 0.001 || features.momentum > 0.001) return "up";
+            if (features.trend < -0.001 || features.momentum < -0.001) return "down";
+            return predDir;
         }
+
+        if (features.trend > 0.001) return "up";
+        if (features.trend < -0.001) return "down";
+        if (features.momentum > 0.001) return "up";
+        if (features.momentum < -0.001) return "down";
+        if (this.lastPoleType === "peak") return "down";
+        if (this.lastPoleType === "trough") return "up";
+        return "up";
     }
     
-    /**
-     * Generate trading signal
-     * Only generates signals for changes >= 0.02, ignores changes < 0.02
-     * Direction is always "up" or "down" (no neutral)
-     */
     private generateSignal(
         direction: "up" | "down",
         confidence: number,
-        features: ReturnType<typeof this.calculateFeatures>
+        features: ReturnType<typeof this.calculateFeatures>,
+        recentAccuracy: number,
     ): "BUY_UP" | "BUY_DOWN" | "HOLD" {
-        
-        // IMPROVED: More conservative signal generation to reduce false positives
-        // Require higher confidence and stronger alignment
-        
-        // Get recent accuracy for adaptive thresholds
-        let recentAccuracy = 0.6;
-        if (this.recentPredictions.length >= 10) {
-            const recentCorrect = this.recentPredictions.filter(p => p.correct).length;
-            recentAccuracy = recentCorrect / this.recentPredictions.length;
-        }
-        
-        // Adaptive thresholds: be more selective when accuracy is low, but allow trades at reasonable confidence
-        // Balanced approach - not too conservative, but still quality-focused
-        const minConfidenceForTrade = recentAccuracy < 0.50 ? 0.65 : (recentAccuracy < 0.55 ? 0.60 : 0.55); // Lower thresholds
+        const minConfidenceForTrade = recentAccuracy < 0.50 ? 0.65 : (recentAccuracy < 0.55 ? 0.60 : 0.55);
         
         // Very high confidence: trade if confidence >= 75% AND trend/momentum align
         if (confidence >= 0.75) {
@@ -907,9 +780,8 @@ export class AdaptivePricePredictor {
         this.poleHistory = [];
         this.lastPolePrice = null;
         this.lastPoleType = null;
-        this.lastPoleTimestamp = null;
         this.lastPrediction = null;
-        // Keep weights (they represent learned knowledge)
+        this.lastPredictionFeatures = null;
     }
 }
 
