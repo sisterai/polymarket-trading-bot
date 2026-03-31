@@ -8,16 +8,15 @@
 4. [MarketSnapshot — The Input Contract](#4-marketsnapshot--the-input-contract)
 5. [Gate System — When Prediction is Skipped](#5-gate-system--when-prediction-is-skipped)
 6. [PoleDetector — Trigger Timing](#6-poledetector--trigger-timing)
-7. [RegimeDetector — Market State Classification](#7-regimedetector--market-state-classification)
-8. [FeatureExtractor — What the Model Sees](#8-featureextractor--what-the-model-sees)
-9. [Online Linear Model — Predict()](#9-online-linear-model--predict)
-10. [EdgeCalculator — From Prediction to Trade Decision](#10-edgecalculator--from-prediction-to-trade-decision)
-11. [Safety Layers — When the Bot Refuses to Trade](#11-safety-layers--when-the-bot-refuses-to-trade)
-12. [Online Learning — learnFromPending()](#12-online-learning--learnfrompending)
-13. [PredictionDiagnostics — Observability & Health](#13-predictiondiagnostics--observability--health)
-14. [Orchestrator — updateAndPredictWithSnapshot() Step by Step](#14-orchestrator--updateandpredictwithsnapshot-step-by-step)
-15. [Key Constants Reference](#15-key-constants-reference)
-16. [Bug Fixes & Safety Improvements (Changelog)](#16-bug-fixes--safety-improvements-changelog)
+7. [FeatureExtractor — What the Model Sees](#7-featureextractor--what-the-model-sees)
+8. [Online Linear Model — Predict()](#8-online-linear-model--predict)
+9. [EdgeCalculator — From Prediction to Trade Decision](#9-edgecalculator--from-prediction-to-trade-decision)
+10. [Safety Layers — When the Bot Refuses to Trade](#10-safety-layers--when-the-bot-refuses-to-trade)
+11. [Online Learning — learnFromPending()](#11-online-learning--learnfrompending)
+12. [PredictionDiagnostics — Observability & Health](#12-predictiondiagnostics--observability--health)
+13. [Orchestrator — updateAndPredictWithSnapshot() Step by Step](#13-orchestrator--updateandpredictwithsnapshot-step-by-step)
+14. [Key Constants Reference](#14-key-constants-reference)
+15. [Recent Bug Fixes & Safety Improvements](#15-recent-bug-fixes--safety-improvements)
 
 ---
 
@@ -27,51 +26,45 @@ The `AdaptivePricePredictor` is the decision engine of the Polymarket BTC 5-minu
 
 **What it does in one sentence:**
 
-> Receives live WebSocket price updates, classifies market regime, detects trigger conditions (poles, momentum surges, expiry), runs an online linear regression model on 12 features, converts the predicted price into a probability and expected edge after regime-conditioned costs, and emits `BUY_UP`, `BUY_DOWN`, or `HOLD`.
+> Receives live WebSocket price updates, detects local price peaks/troughs (poles), runs an online linear regression model on 12 features, converts the predicted price into a probability and expected edge after cost, and emits `BUY_UP`, `BUY_DOWN`, or `HOLD`.
 
 **What makes it "safe":**
 
-The system has **7 independent safety gates** that all must pass before any trade is executed. If any single gate fails, the output is `HOLD` (no trade). The bot also auto-disables if live diagnostics detect model degradation, drawdown limits, losing streaks, or abnormal market conditions.
+The system has **6 independent safety gates** that all must pass before any trade is executed. If any single gate fails, the output is `HOLD` (no trade). The bot also auto-disables if live diagnostics detect model degradation, drawdown limits, or abnormal market conditions.
 
 ---
 
 ## 2. Architecture: Component Map
 
 ```
-┌───────────────────────────────────────────────────────────────────┐
-│                    AdaptivePricePredictor                          │
-│                       (Orchestrator)                               │
-│                                                                    │
-│  Owns: priceHistory[], weights, pending prediction, noise filter   │
-│  Delegates to:                                                     │
-│                                                                    │
-│  ┌────────────────┐  ┌──────────────────┐  ┌──────────────────┐   │
-│  │  PoleDetector   │  │  RegimeDetector   │  │ FeatureExtractor │   │
-│  │                │  │                  │  │                  │   │
-│  │ Detects local  │  │ Classifies into: │  │ 6 legacy +       │   │
-│  │ peaks/troughs  │  │  momentum        │  │ 6 microstructure │   │
-│  │ in smoothed    │  │  reversal        │  │ features         │   │
-│  │ price series   │  │  chop            │  │                  │   │
-│  │                │  │  expiry          │  │ Owns EMA state,  │   │
-│  │                │  │                  │  │ normalization,   │   │
-│  │                │  │ Uses raw values  │  │ quote intensity  │   │
-│  └────────────────┘  └──────────────────┘  └──────────────────┘   │
-│                                                                    │
-│  ┌──────────────────┐  ┌─────────────────────────────────────┐    │
-│  │  EdgeCalculator   │  │       PredictionDiagnostics          │    │
-│  │                  │  │                                     │    │
-│  │ sigmoid(delta)   │  │ Records every prediction, resolves  │    │
-│  │ → pUp/pDown      │  │ against outcome, tracks hit rate,   │    │
-│  │ → edge per side  │  │ calibration, PnL, drawdown, losing  │    │
-│  │ → regime-gated   │  │ streak, regime distribution, health  │    │
-│  │   safety checks  │  │                                     │    │
-│  │ → signal         │  │                                     │    │
-│  └──────────────────┘  └─────────────────────────────────────┘    │
-└───────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                   AdaptivePricePredictor                        │
+│                      (Orchestrator)                             │
+│                                                                 │
+│  Owns: priceHistory[], weights, pending prediction              │
+│  Delegates to:                                                  │
+│                                                                 │
+│  ┌──────────────┐  ┌──────────────────┐  ┌──────────────────┐  │
+│  │ PoleDetector  │  │ FeatureExtractor  │  │ EdgeCalculator   │  │
+│  │              │  │                  │  │                  │  │
+│  │ Detects local│  │ 6 legacy +       │  │ sigmoid(delta)   │  │
+│  │ peaks/troughs│  │ 6 microstructure │  │ → pUp/pDown      │  │
+│  │ in smoothed  │  │ features         │  │ → edge per side  │  │
+│  │ price series │  │                  │  │ → 6 safety gates │  │
+│  │              │  │ Owns EMA state,  │  │ → signal         │  │
+│  │              │  │ normalization    │  │                  │  │
+│  └──────────────┘  └──────────────────┘  └──────────────────┘  │
+│                                                                 │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │              PredictionDiagnostics                        │   │
+│  │  Records every prediction, resolves against outcome,     │   │
+│  │  tracks hit rate, calibration, PnL, drawdown, health     │   │
+│  └──────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 **File locations:**
-- `src/utils/pricePredictor.ts` — PoleDetector, RegimeDetector, FeatureExtractor, EdgeCalculator, AdaptivePricePredictor
+- `src/utils/pricePredictor.ts` — PoleDetector, FeatureExtractor, EdgeCalculator, AdaptivePricePredictor
 - `src/utils/diagnostics.ts` — PredictionDiagnostics, record types, health system
 
 ---
@@ -91,32 +84,28 @@ WebSocket best_bid_ask event
 └───────────┬───────────────────────────┘
             │
             ▼
-┌─ predictor.updateAndPredictWithSnapshot(snapshot) ──────────────┐
-│                                                                  │
-│  1. Price range gate               → null if invalid             │
-│  2. First-price gate               → null if first               │
-│  3. Adaptive noise filter gate     → null if Δ < threshold       │
-│  4. Smooth price (EMA α=0.5)                                     │
-│  5. Track quote arrival + spread (for quoteIntensity / filter)   │
-│  6. Buffer update (keep last 10)                                 │
-│  7. Minimum history gate           → null if < 3                 │
-│  8. Regime detection (momentum / reversal / chop / expiry)       │
-│  9. Prediction trigger gate        → null if no trigger          │
-│     • pole detected → always trigger                             │
-│     • momentum regime + 2 updates → trigger                      │
-│     • expiry regime + 1 update → trigger                         │
-│  ──────────────────────────────────────────────────────────────  │
-│ 10. Learn from previous pending prediction                       │
-│ 11. Extract 12 features                                          │
-│ 12. Run linear model → predictedPrice                            │
-│ 13. Update EMA                                                   │
-│ 14. EdgeCalculator.compute(regime) → signal                      │
-│ 15. Store current as pending                                     │
-│ 16. Record in diagnostics                                        │
-│                                                                  │
-│  Returns PricePrediction { signal, direction, regime,            │
-│    pUp, pDown, edgeBuyUp, edgeBuyDown, isPoleValue, ... }        │
-└───────────────────────┬──────────────────────────────────────────┘
+┌─ predictor.updateAndPredictWithSnapshot(snapshot) ─┐
+│                                                     │
+│  1. Price range gate             → null if invalid  │
+│  2. First-price gate             → null if first    │
+│  3. Noise filter gate            → null if < 0.02   │
+│  4. Smooth price (EMA α=0.5)                        │
+│  5. Track quote arrival (for quoteIntensity)        │
+│  6. Buffer update (keep last 10)                    │
+│  7. Minimum history gate         → null if < 3      │
+│  8. Pole detection gate          → null if no pole  │
+│  ─────────────────────────────────────────────────  │
+│  9. Learn from previous pending prediction          │
+│ 10. Extract 12 features                             │
+│ 11. Run linear model → predictedPrice               │
+│ 12. Update EMA                                      │
+│ 13. EdgeCalculator.compute() → signal               │
+│ 14. Store current as pending                        │
+│ 15. Record in diagnostics                           │
+│                                                     │
+│  Returns PricePrediction { signal, direction,       │
+│    pUp, pDown, edgeBuyUp, edgeBuyDown, ... }        │
+└───────────────────────┬─────────────────────────────┘
                         │
                         ▼
 ┌─ updown-bot.ts: executePredictionTrade() ──────────┐
@@ -133,7 +122,7 @@ WebSocket best_bid_ask event
 ## 4. MarketSnapshot — The Input Contract
 
 ```typescript
-// src/utils/pricePredictor.ts
+// src/utils/pricePredictor.ts:38-55
 
 interface MarketSnapshot {
     bestAsk: number;                // UP token ask price (REQUIRED)
@@ -170,67 +159,42 @@ const snapshot: MarketSnapshot = {
 
 ## 5. Gate System — When Prediction is Skipped
 
-The predictor has **5 sequential gates** plus a **regime-conditioned trigger** before any prediction is attempted. Each returns `null` (skip this update) if the gate fails:
+The predictor has **5 sequential gates** before any prediction is attempted. Each returns `null` (skip this update) if the gate fails:
 
 | # | Gate | Condition to PASS | Purpose |
 |---|------|-------------------|---------|
 | 1 | Price range | `0.003 ≤ price ≤ 0.97` | Reject degenerate prices near 0 or 1 |
 | 2 | First price | `smoothedPrice !== null` | Initialize on first call, no prediction possible |
-| 3 | Adaptive noise filter | `|rawPrice - lastRawPrice| ≥ adaptiveThreshold` | Ignore tiny price jitters scaled to market conditions |
+| 3 | Noise filter | `|rawPrice - lastRawPrice| ≥ 0.02` | Ignore tiny price jitters, reduce noise |
 | 4 | Minimum history | `priceHistory.length ≥ 3` | Need at least 3 points for meaningful features |
-| 5 | Prediction trigger | Pole detected, OR momentum+2 updates, OR expiry+1 update | Only predict when there's a meaningful trading opportunity |
+| 5 | Pole detection | PoleDetector returns `true` | Only predict at local peaks/troughs |
 
-### Adaptive Noise Filter (Gate 3)
-
-Previously used a fixed `NOISE_THRESHOLD = 0.02`. Now the threshold adapts to market conditions:
-
-```
-adaptiveThreshold = max(
-    NOISE_ABSOLUTE_MIN,          // 0.005 — hard floor
-    TICK_FLOOR,                  // 0.01  — minimum tick size
-    NOISE_SPREAD_FACTOR × spread,  // 0.5 × current spread
-    NOISE_VOL_FACTOR × volatility  // 0.3 × recent std dev
-)
-```
-
-| Market condition | Spread | Threshold | Effect |
-|-----------------|--------|-----------|--------|
-| Tight market | 0.02 | ~0.01 | Accept small moves (1 cent) |
-| Normal market | 0.04 | ~0.02 | Filter small noise (2 cents) |
-| Wide market | 0.10 | ~0.05 | Only large moves pass (5 cents) |
-
-The filter compares **raw-to-raw prices** (not raw-to-smoothed), ensuring a consistent threshold:
+**Important fix (noise filter):** Previously compared raw price to the *smoothed* `lastAddedPrice`, creating an inconsistent threshold. Now tracks `lastRawPrice` separately and compares raw-to-raw.
 
 ```typescript
+// BEFORE (bug): compared raw to smoothed
+if (Math.abs(price - this.lastAddedPrice) < NOISE_THRESHOLD) return null;
+// lastAddedPrice was the smoothed price
+
+// AFTER (fixed): compare raw to raw
 if (this.lastRawPrice !== null &&
-    Math.abs(price - this.lastRawPrice) < adaptiveThreshold) {
-    return null;
-}
+    Math.abs(price - this.lastRawPrice) < NOISE_THRESHOLD) return null;
 this.lastRawPrice = price;
 ```
-
-### Prediction Trigger (Gate 5)
-
-The prediction trigger is **regime-conditioned** — different market states allow different trigger conditions:
-
-| Regime | Trigger condition | Rationale |
-|--------|-------------------|-----------|
-| **reversal** | Pole only | Classic behavior — wait for price reversals |
-| **momentum** | Pole, OR 2+ updates since last prediction | Capture continuation trades during strong moves |
-| **expiry** | Pole, OR 1+ update since last prediction | Trade more frequently as round nears end |
-| **chop** | Pole only (but EdgeCalculator forces HOLD) | Detect pole structure, but never trade |
 
 ---
 
 ## 6. PoleDetector — Trigger Timing
 
-The predictor's primary trigger mechanism. It detects local peaks and troughs in the smoothed price series.
+The predictor does **not** produce a prediction on every price update. It only predicts at "poles" — local peaks and troughs in the smoothed price series.
 
 **Why poles?** Poles represent moments where the price has just reversed direction. Predicting at these inflection points captures the moment of maximum information about the next directional move.
 
 **Detection logic:**
 
 ```typescript
+// src/utils/pricePredictor.ts:149-182
+
 detect(priceHistory, timestamp, noiseThreshold) {
     // Need at least 3 prices
     const price = priceHistory[last];
@@ -261,60 +225,7 @@ Price: 0.52  0.55  0.58  0.54  0.51  0.53  0.56
 
 ---
 
-## 7. RegimeDetector — Market State Classification
-
-The `RegimeDetector` classifies the current market into one of four regimes **before** the pole gate. The detected regime influences two things:
-
-1. **Prediction trigger** — momentum and expiry regimes allow non-pole predictions
-2. **EdgeCalculator thresholds** — each regime has its own MIN_EDGE and VOL_CIRCUIT_BREAKER
-
-### Regimes
-
-| Regime | Meaning | Prediction trigger | Trading behavior |
-|--------|---------|-------------------|-----------------|
-| **momentum** | Strong directional move | Pole + momentum bypass (2 updates) | Trade continuations with slightly lower edge threshold |
-| **reversal** | Local peak/trough | Pole only | Classic pole-based entry, standard thresholds |
-| **chop** | Flat, no clear direction | Pole only (but forced HOLD) | Never trade — no signal worth pursuing |
-| **expiry** | Final portion of 5-min round | Pole + expiry bypass (1 update) | Higher edge requirement — book may be distorted |
-
-### Detection Logic
-
-The detector receives **raw** values (not feature-space scaled):
-
-```typescript
-detect(momentum, volatility, trend, timeRemaining): MarketRegime {
-    // 1. Expiry takes priority — book changes fundamentally
-    if (timeRemaining > 0.85) return "expiry";
-
-    // 2. Momentum — strong directional move
-    if (|trend| > 0.01 && volatility > 0.005 && |momentum| > 0.02)
-        return "momentum";
-
-    // 3. Chop — flat, low-energy market
-    if (volatility < 0.005 && |trend| < 0.003 && |momentum| < 0.01)
-        return "chop";
-
-    // 4. Default — reversal
-    return "reversal";
-}
-```
-
-### Threshold Calibration
-
-Thresholds are calibrated to the **raw** input ranges for a token priced 0.40-0.60:
-
-| Input | Source | Typical range | Used for |
-|-------|--------|---------------|----------|
-| `momentum` | `(current - lag1) / lag1` | [-0.10, +0.10] | Momentum: > 0.02, Chop: < 0.01 |
-| `volatility` | Std dev of last 5 smoothed prices | [0.003, 0.03] | Momentum: > 0.005, Chop: < 0.005 |
-| `trend` | `emaShort - emaLong` | [-0.03, +0.03] | Momentum: > 0.01, Chop: < 0.003 |
-| `timeRemaining` | `elapsed / 300000` | [0, 1] | Expiry: > 0.85 |
-
-**Critical note:** These are RAW values (not feature-space). The feature-space `trend` is `rawTrend * 10` clamped to [-1, 1], and feature-space `volatility` is `rawVol * 5` clamped to [0, 1]. The RegimeDetector operates on the raw values *before* scaling.
-
----
-
-## 8. FeatureExtractor — What the Model Sees
+## 7. FeatureExtractor — What the Model Sees
 
 The model uses **12 features** organized into two groups:
 
@@ -340,24 +251,14 @@ The model uses **12 features** organized into two groups:
 | `timeRemaining` | [0,1] | 0.5 | `elapsed / 300000` (5 min in ms) | Expiry proximity — near 1 = expiry |
 | `quoteIntensity` | [0,1] | 0 | EMA-smoothed quote arrival rate / 10 | Market activity level |
 
-### Quote Intensity Tracking
-
-`trackQuoteArrival()` is called on **every accepted price update** (before the pole gate) so the EMA tracks actual WebSocket quote frequency, not pole frequency:
+**Quote intensity fix:** Previously `computeQuoteIntensity()` was only called inside `extractWithSnapshot()`, which only runs at pole detections. This meant it measured *pole frequency* (every few seconds), not *quote update frequency* (many per second). Fixed by adding `trackQuoteArrival()` called on every accepted price update before the pole gate:
 
 ```typescript
 // Called on EVERY accepted update (before pole gate)
 this.extractor.trackQuoteArrival(snapshot);
 
-// Later, inside extractWithSnapshot (only at prediction trigger):
+// Later, inside extractWithSnapshot (only at poles):
 quoteIntensity: this.computeQuoteIntensity(), // reads pre-computed EMA
-```
-
-### Spread Tracking
-
-`trackSpread()` is called on every accepted update to feed the adaptive noise filter:
-
-```typescript
-this.extractor.trackSpread(snapshot);  // stores latest spread for noise filter
 ```
 
 ### Normalization
@@ -375,11 +276,13 @@ This keeps the model numerically stable regardless of the absolute price level o
 
 ---
 
-## 9. Online Linear Model — Predict()
+## 8. Online Linear Model — Predict()
 
 The core model is a **weighted linear combination** of all 12 features:
 
 ```typescript
+// src/utils/pricePredictor.ts:768-786
+
 predict(features: FeatureVector) {
     const rawScore =
         w.intercept +
@@ -409,19 +312,18 @@ predict(features: FeatureVector) {
 - Legacy features have non-zero initial weights (e.g., `momentum: 0.35`, `trend: 0.45`) based on prior domain knowledge.
 - Microstructure features start at **zero** — no behavior change at deployment. The online learner discovers their signal over time.
 
-**Output:** `predictedPrice` is the model's estimate of where the UP token smoothed price will be at the next trigger point.
+**Output:** `predictedPrice` is the model's estimate of where the UP token smoothed price will be at the next pole.
 
 ---
 
-## 10. EdgeCalculator — From Prediction to Trade Decision
+## 9. EdgeCalculator — From Prediction to Trade Decision
 
-This is the most critical component for safety. It converts the raw model prediction into a **probabilistic, cost-aware, regime-conditioned trade decision**.
+This is the most critical component for safety. It converts the raw model prediction into a **probabilistic, cost-aware trade decision**.
 
 ### Step-by-step pipeline
 
 ```
-predictedPrice → delta → sigmoid → pUp/pDown → edge per side
-    → regime thresholds → safety gates → signal
+predictedPrice → delta → sigmoid → pUp/pDown → edge per side → safety gates → signal
 ```
 
 ### Step 1: Predicted move to probability
@@ -488,78 +390,52 @@ const adjustedEdge = bestEdge * accuracyFactor;
 
 If the model's recent accuracy drops below 50%, the effective edge is scaled down. At 30% accuracy, the edge is multiplied by 0.8. This makes it progressively harder to reach the trade threshold when the model is underperforming.
 
-### Step 6: Regime-conditioned signal gating
-
-The EdgeCalculator applies **regime-specific** thresholds:
+### Step 6: Signal gating (6 safety layers)
 
 ```typescript
-// Chop regime → NEVER trade
-if (regime === "chop") → HOLD
-
-// Warm-up gate
-if (resolvedCount < 5) → HOLD
-
-// Spread liquidity gate
-if (spread > 0.06) → HOLD
-
-// Regime-specific volatility circuit breaker
-if (volatility > volBreaker[regime]) → HOLD
-
-// Regime-specific edge threshold
-if (adjustedEdge >= minEdge[regime]) → BUY_UP or BUY_DOWN
-else → HOLD
+if (resolvedCount < WARMUP_MIN_RESOLVED)           → HOLD  // Not enough data
+else if (volatility > VOL_CIRCUIT_BREAKER)          → HOLD  // Market too chaotic
+else if (spread > MAX_SPREAD_TO_TRADE)              → HOLD  // Too illiquid
+else if (adjustedEdge >= MIN_EDGE)                  → BUY_UP or BUY_DOWN
+else                                                → HOLD  // Edge too weak
 ```
-
-**Regime-specific thresholds:**
-
-| Regime | MIN_EDGE | VOL_BREAKER | Rationale |
-|--------|----------|-------------|-----------|
-| **momentum** | 0.025 (2.5%) | 0.12 | Lower bar — model has directional conviction, higher vol is expected |
-| **reversal** | 0.03 (3%) | 0.08 | Standard — classic pole trade needs clear edge |
-| **chop** | N/A | N/A | **Forced HOLD** — no signal worth pursuing |
-| **expiry** | 0.04 (4%) | 0.06 | Higher bar — book distortion near expiry, need strong conviction |
 
 ---
 
-## 11. Safety Layers — When the Bot Refuses to Trade
+## 10. Safety Layers — When the Bot Refuses to Trade
 
 The system has **multiple independent safety mechanisms**. A trade is only placed when ALL of them agree:
 
-### Layer 1: Chop Regime Block (EdgeCalculator)
-- **Condition:** `regime === "chop"`
-- **Behavior:** Force HOLD unconditionally
-- **Why:** Flat markets produce random noise, not tradable signals
-
-### Layer 2: Warm-up Gate (EdgeCalculator)
+### Layer 1: Warm-up Gate (EdgeCalculator)
 - **Threshold:** `resolvedCount < 5`
 - **Behavior:** Force HOLD until at least 5 predictions have been made AND evaluated against real outcomes
 - **Why:** Prevents trading before the model has any validated track record
+
+### Layer 2: Volatility Circuit Breaker (EdgeCalculator)
+- **Threshold:** `volatility > 0.08`
+- **Behavior:** Force HOLD during high volatility
+- **Why:** Chaotic price action makes predictions unreliable and fills unpredictable
 
 ### Layer 3: Spread Liquidity Gate (EdgeCalculator)
 - **Threshold:** `spread > 0.06`
 - **Behavior:** Force HOLD when bid-ask spread is too wide
 - **Why:** Wide spreads mean high execution cost and poor fill quality
 
-### Layer 4: Volatility Circuit Breaker (EdgeCalculator, regime-conditioned)
-- **Thresholds:** Momentum 0.12, Reversal 0.08, Expiry 0.06
-- **Behavior:** Force HOLD during high volatility (relative to regime expectation)
-- **Why:** Chaotic price action makes predictions unreliable. Momentum tolerates more volatility (it IS the regime). Expiry is strictest (chaotic near expiry is dangerous).
-
-### Layer 5: Edge Threshold (EdgeCalculator, regime-conditioned)
-- **Thresholds:** Momentum 0.025, Reversal 0.03, Expiry 0.04
+### Layer 4: Edge Threshold (EdgeCalculator)
+- **Threshold:** `adjustedEdge < 0.03` (3 cents per share)
 - **Behavior:** Force HOLD when edge after cost is insufficient
 - **Why:** Only trade when expected profit clearly exceeds transaction costs
 
-### Layer 6: Diagnostics Health Check (updown-bot.ts)
+### Layer 5: Diagnostics Health Check (updown-bot.ts)
 Before executing any trade, the bot queries `diagnostics.getHealthStatus()`:
 
 | Check | Threshold | Action |
 |-------|-----------|--------|
 | Accuracy collapse | < 35% over last 20 predictions | **Disable trading entirely** |
 | Max drawdown | Rolling PnL below -15% | **Disable trading entirely** |
-| Losing streak | 5+ consecutive losing trades (current) | **Disable trading entirely** |
 | Overconfidence | Avg confidence > 72% but hit rate < 50% | Warning logged |
 | Spread anomaly | Avg spread > 0.08 over last 10 records | Warning logged |
+| Losing streak | 5+ consecutive losing trades | Warning logged |
 
 ```typescript
 // In updown-bot.ts executePredictionTrade():
@@ -570,15 +446,15 @@ if (!health.tradingAllowed) {
 }
 ```
 
-### Layer 7: Per-Side Position Limits (updown-bot.ts)
+### Layer 6: Per-Side Position Limits (updown-bot.ts)
 - Max `N` buys per side (UP / DOWN) per market cycle
 - Once limit is reached, market is paused
 
-**Net effect:** The bot will produce far more HOLD signals than trade signals. This is intentional — it only trades when the model is confident, the regime is favorable, the market is liquid, the edge is clear, and the track record supports it.
+**Net effect:** The bot will produce far more HOLD signals than trade signals. This is intentional — it only trades when the model is confident, the market is liquid, the edge is clear, and the track record supports it.
 
 ---
 
-## 12. Online Learning — learnFromPending()
+## 11. Online Learning — learnFromPending()
 
 ### The Timing Problem (previously a bug)
 
@@ -587,12 +463,12 @@ The model learns online — it updates its weights based on how well previous pr
 ### Learning Lifecycle
 
 ```
-Trigger T:
+Pole T:
   1. Extract features_T from current price history
   2. Predict: predictedPrice_T = model(features_T)
   3. Store as pending: { features_T, predictedPrice_T, basePrice_T }
 
-Trigger T+1:
+Pole T+1:
   1. outcomePrice = current smoothed price
   2. LEARN: evaluate pending prediction against outcomePrice
      - error = outcomePrice - predictedPrice_T
@@ -603,8 +479,6 @@ Trigger T+1:
   5. Predict: predictedPrice_T+1 = model(features_T+1)  ← uses updated weights
   6. Store as pending
 ```
-
-**Note:** "Trigger" means any prediction trigger — pole, momentum bypass, or expiry bypass. The learning lifecycle works identically regardless of trigger type.
 
 **Key guarantees:**
 - Features used for learning were computed **before** the outcome was known
@@ -639,7 +513,7 @@ weight_i = weight_i * decay + grad * feature_i;
 
 ---
 
-## 13. PredictionDiagnostics — Observability & Health
+## 12. PredictionDiagnostics — Observability & Health
 
 `PredictionDiagnostics` (in `diagnostics.ts`) is a standalone observer that runs alongside the predictor without affecting its behavior.
 
@@ -655,12 +529,11 @@ Every prediction generates a `PredictionRecord`:
     pUp, pDown, edgeBuyUp, edgeBuyDown, // Edge analysis
     direction, signal, confidence,      // Decision
     momentum, volatility, trend,        // Key features
-    basePrice,                          // Reference price
-    regime                              // Detected market regime
+    basePrice                           // Reference price
 }
 ```
 
-When the outcome arrives (at next trigger), it becomes a `ResolvedRecord` with:
+When the outcome arrives (at next pole), it becomes a `ResolvedRecord` with:
 
 ```typescript
 {
@@ -675,11 +548,9 @@ When the outcome arrives (at next trigger), it becomes a `ResolvedRecord` with:
 ### Rolling performance stats
 
 ```
---- DIAGNOSTICS (150 total, 150 in window) ---
 Hit rate: 58.0% | Trade hit rate: 62.5%
-Traded: 24 | Hold: 126 | No-trade rate: 84%
+Traded: 24 | Hold: 176 | No-trade rate: 88%
 BUY_UP: 14 (64%) | BUY_DOWN: 10 (60%)
-Regimes: momentum=32 reversal=85 chop=18 expiry=15
 Avg edge before cost: 1.82% | after cost: 0.45%
 Rolling PnL: 3.21% | Max drawdown: -2.14%
 Calibration: [0.50-0.60] n=85 hit=52% | [0.60-0.70] n=67 hit=58% | ...
@@ -687,118 +558,62 @@ Calibration: [0.50-0.60] n=85 hit=52% | [0.60-0.70] n=67 hit=58% | ...
 
 ### Health assessment (single-pass scan)
 
-The `getHealthStatus()` method scans the **full** resolved buffer (up to 200 records) in a single pass. It computes:
+The `getHealthStatus()` method scans the resolved buffer in a single pass and evaluates:
 
-1. **Accuracy** from the last 20 records (health window)
-2. **Spread anomaly** from the last 10 records (spread window)
-3. **Drawdown** across the **entire** buffer (needs full history)
-4. **Current losing streak** at the **tail** of the buffer (not historical max)
-
-**Trading halt conditions** (`tradingAllowed = false`):
-
-| Check | Threshold | Why |
-|-------|-----------|-----|
-| Accuracy collapse | < 35% over last 20 | Model has broken down |
-| Max drawdown | Rolling PnL below -15% | Too much capital lost |
-| Losing streak | 5+ consecutive losses **currently active** | Pattern of repeated failures |
-
-**Warning-only conditions:**
-
-| Check | Threshold | Why |
-|-------|-----------|-----|
-| Overconfidence | Avg confidence > 72% + hit rate < 50% | Model is miscalibrated |
-| Spread anomaly | Avg spread > 0.08 over last 10 | Market becoming illiquid |
-
-**Important:** The losing streak check uses the **current** streak (the one active at the end of the buffer), not the worst historical streak. If a 5-loss streak occurred 100 predictions ago but was followed by 50 wins, trading remains enabled.
+1. **Accuracy collapse**: Hit rate < 35% over last 20 predictions → **disable trading**
+2. **Max drawdown**: Rolling PnL below -15% → **disable trading**
+3. **Overconfidence**: High confidence + low hit rate → warning
+4. **Spread anomaly**: Recent avg spread > 8 cents → warning
+5. **Losing streak**: 5+ consecutive wrong trades → warning
 
 ---
 
-## 14. Orchestrator — updateAndPredictWithSnapshot() Step by Step
+## 13. Orchestrator — updateAndPredictWithSnapshot() Step by Step
 
-Here is the exact sequence of operations:
+Here is the exact sequence of operations, with line references:
 
 ```
 updateAndPredictWithSnapshot(snapshot)
 │
-├─ Gate 1: price range check
-│   └─ 0.003 ≤ bestAsk ≤ 0.97
+├─ Gate 1: price range check                    [line 633-636]
+├─ Gate 2: first-price initialization           [line 638-644]
+├─ Gate 3: noise filter (raw vs raw)            [line 647-653]
+├─ Smooth: EMA(α=0.5) on price                 [line 655-665]
+├─ Track quote arrival (quoteIntensity EMA)     [line 667-668]
+├─ Buffer: push smoothed price, cap at 10      [line 670-678]
+├─ Gate 4: minimum history (need 3+)           [line 680-681]
+├─ Gate 5: pole detection                       [line 683-685]
 │
-├─ Gate 2: first-price initialization
-│   └─ smoothedPrice === null → initialize, return null
+│  ═══ Past all gates → at a pole ═══
 │
-├─ Gate 3: adaptive noise filter
-│   └─ |rawPrice - lastRawPrice| < max(0.005, 0.01, 0.5×spread, 0.3×vol)
-│      → return null
-│
-├─ Smooth: EMA(α=0.5) on accepted price
-│
-├─ Track: quoteArrival (for quoteIntensity EMA)
-├─ Track: spread (for adaptive noise filter)
-├─ Increment: updatesSinceLastPrediction
-│
-├─ Buffer: push smoothed price, cap at 10
-│
-├─ Gate 4: minimum history (need 3+)
-│
-├─ Regime detection (lightweight, before trigger gate)
-│   └─ Uses raw momentum, volatility, EMA trend, timeRemaining
-│   └─ Returns: momentum | reversal | chop | expiry
-│
-├─ Gate 5: prediction trigger (regime-conditioned)
-│   ├─ Pole detected? → trigger
-│   ├─ Momentum regime + 2 updates since last prediction? → trigger
-│   ├─ Expiry regime + 1 update since last prediction? → trigger
-│   └─ None of the above? → return null
-│
-│  ═══ Past all gates → prediction triggered ═══
-│
-├─ Reset: updatesSinceLastPrediction = 0
-│
-├─ Step 1: learnFromPending(currentPrice)
+├─ Step 1: learnFromPending(currentPrice)       [line 702-703]
 │   └─ If pending exists: evaluate, update weights, record diagnostics
 │
-├─ Step 2: updateStatistics + extractWithSnapshot
+├─ Step 2: updateStatistics + extractWithSnapshot [line 705-707]
 │   └─ Compute all 12 features from history + snapshot
 │
-├─ Step 3: predict(features)
+├─ Step 3: predict(features)                    [line 709-710]
 │   └─ Linear model → rawScore → denormalize → predictedPrice
 │
-├─ Step 4: updateEMA(currentPrice)
+├─ Step 4: updateEMA(currentPrice)              [line 712-713]
 │   └─ Update short/long EMA for next call's trend feature
 │
-├─ Step 5: edge.compute({ ..., regime })
-│   └─ sigmoid → pUp/pDown → edge → regime-conditioned gates → signal
+├─ Step 5: edge.compute(...)                    [line 715-725]
+│   └─ sigmoid → pUp/pDown → edge → 6 safety gates → signal
 │
-├─ Step 6: store as pending
+├─ Step 6: store as pending                     [line 727-733]
 │   └─ Freeze { features, predictedPrice, basePrice, confidence }
 │
-├─ Step 7: diagnostics.record(result, snapshot, currentPrice)
+├─ Step 7: diagnostics.record(result)           [line 754-755]
 │
-├─ Timing guard: warn if > 20ms
+├─ Timing guard: warn if > 20ms                [line 757-759]
 │
-└─ Return PricePrediction {
-       predictedPrice, confidence, direction, signal,
-       isPoleValue, regime,
-       pUp, pDown, edgeBuyUp, edgeBuyDown, rawScore,
-       features: { momentum, volatility, trend }
-   }
+└─ Return PricePrediction                       [line 763]
 ```
 
 ---
 
-## 15. Key Constants Reference
-
-### RegimeDetector — Market State Classification
-
-| Constant | Value | Input type | Purpose |
-|----------|-------|------------|---------|
-| `EXPIRY_THRESHOLD` | 0.85 | timeRemaining [0,1] | Last 45s of 5-min round → expiry |
-| `MOMENTUM_TREND_THRESHOLD` | 0.01 | raw EMA diff | Min |EMA trend| for momentum |
-| `MOMENTUM_MOM_THRESHOLD` | 0.02 | raw % change | Min |momentum| for momentum |
-| `MOMENTUM_VOL_FLOOR` | 0.005 | raw std dev | Min volatility for momentum |
-| `CHOP_VOL_CEILING` | 0.005 | raw std dev | Max volatility for chop |
-| `CHOP_TREND_CEILING` | 0.003 | raw EMA diff | Max |EMA trend| for chop |
-| `CHOP_MOM_CEILING` | 0.01 | raw % change | Max |momentum| for chop |
+## 14. Key Constants Reference
 
 ### EdgeCalculator — Trade Decision
 
@@ -807,24 +622,17 @@ updateAndPredictWithSnapshot(snapshot)
 | `SIGMOID_SENSITIVITY` | 15 | How aggressively price delta maps to probability |
 | `FIXED_COST` | 0.008 | Slippage + Polymarket taker fee estimate per share |
 | `DEFAULT_HALF_SPREAD` | 0.008 | Assumed half-spread when actual spread is unavailable |
+| `MIN_EDGE` | 0.03 | Minimum net edge after cost required to trade (3%) |
+| `VOL_CIRCUIT_BREAKER` | 0.08 | Max volatility before forcing HOLD |
 | `MAX_SPREAD_TO_TRADE` | 0.06 | Max spread before forcing HOLD (6 cents) |
 | `WARMUP_MIN_RESOLVED` | 5 | Min validated predictions before trading allowed |
-| `MIN_EDGE_MOMENTUM` | 0.025 | Min net edge after cost for momentum regime |
-| `MIN_EDGE_REVERSAL` | 0.03 | Min net edge after cost for reversal regime |
-| `MIN_EDGE_EXPIRY` | 0.04 | Min net edge after cost for expiry regime |
-| `VOL_BREAKER_MOMENTUM` | 0.12 | Volatility circuit breaker for momentum |
-| `VOL_BREAKER_REVERSAL` | 0.08 | Volatility circuit breaker for reversal |
-| `VOL_BREAKER_EXPIRY` | 0.06 | Volatility circuit breaker for expiry |
 
 ### AdaptivePricePredictor — Model & Filtering
 
 | Constant | Value | Purpose |
 |----------|-------|---------|
 | `MAX_HISTORY` | 10 | Price buffer size (rolling window) |
-| `TICK_FLOOR` | 0.01 | Minimum tick size for noise filter |
-| `NOISE_SPREAD_FACTOR` | 0.5 | Noise threshold = 0.5 × recent spread |
-| `NOISE_VOL_FACTOR` | 0.3 | Noise threshold = 0.3 × recent volatility |
-| `NOISE_ABSOLUTE_MIN` | 0.005 | Hard floor for noise threshold |
+| `NOISE_THRESHOLD` | 0.02 | Min raw price change to accept update (2 cents) |
 | `SMOOTHING_ALPHA` | 0.5 | EMA smoothing factor (higher = more reactive) |
 | `MIN_PRICE` / `MAX_PRICE` | 0.003 / 0.97 | Valid price range |
 | `LEARNING_RATE` | 0.05 | Base SGD learning rate |
@@ -837,67 +645,43 @@ updateAndPredictWithSnapshot(snapshot)
 |----------|-------|---------|
 | `BUFFER_CAPACITY` | 200 | Max resolved records kept in memory |
 | `HEALTH_WINDOW` | 20 | Lookback for accuracy assessment |
-| `ACCURACY_COLLAPSE_THRESHOLD` | 0.35 | Below this → **disable trading** |
-| `MAX_DRAWDOWN_THRESHOLD` | -0.15 | Below this → **disable trading** |
-| `LOSING_STREAK_LIMIT` | 5 | Consecutive losses → **disable trading** |
+| `ACCURACY_COLLAPSE_THRESHOLD` | 0.35 | Below this → disable trading |
+| `MAX_DRAWDOWN_THRESHOLD` | -0.15 | Below this → disable trading |
 | `OVERCONFIDENCE_CONF_THRESHOLD` | 0.72 | Confidence above this + low hit rate → warning |
-| `OVERCONFIDENCE_HIT_THRESHOLD` | 0.50 | Hit rate below this + high confidence → warning |
+| `LOSING_STREAK_LIMIT` | 5 | Consecutive losses triggering warning |
 | `SPREAD_ANOMALY_THRESHOLD` | 0.08 | Avg spread above this → warning |
-| `SPREAD_ANOMALY_WINDOW` | 10 | Lookback for spread anomaly check |
 
 ---
 
-## 16. Bug Fixes & Safety Improvements (Changelog)
+## 15. Recent Bug Fixes & Safety Improvements
 
-### Round 1: Structural Refactoring & Core Bug Fixes
+### Bugs Fixed
 
 | # | Issue | Impact | Fix |
 |---|-------|--------|-----|
-| 1 | **Label leakage** — model trained on features containing the outcome | Model appeared accurate but had no real predictive power | Introduced `PendingPrediction` buffer with learn-then-predict lifecycle |
-| 2 | **Dead stability code** — `stablePriceCount`, `updateStability()` computed but never read | Wasted CPU, confusing dead code | Removed entirely |
-| 3 | **Noise filter compared raw to smoothed** — inconsistent threshold reference | Threshold behavior was unpredictable | Added `lastRawPrice` field, compare raw-to-raw |
-| 4 | **quoteIntensity measured pole frequency** — only called at pole detections | Feature measured wrong thing entirely | Added `trackQuoteArrival()` on every accepted update |
-| 5 | **Cold-start accuracy** — returned phantom 0.6 with no data | False confidence before validation | Return 0.5 (coin-flip) |
+| 1 | **Dead stability code** — `stablePriceCount`, `updateStability()` were computed but never read | Wasted CPU, confusing dead code | Removed entirely |
+| 2 | **Noise filter compared raw to smoothed** — `|rawPrice - smoothedPrice|` used inconsistent reference | Threshold behavior was unpredictable | Added `lastRawPrice` field, compare raw-to-raw |
+| 3 | **quoteIntensity measured pole frequency** — only called at pole detections, not on every WS update | Feature measured the wrong thing entirely | Added `trackQuoteArrival()` called on every accepted update |
 
-### Round 2: Safety Improvements
+### Safety Improvements
 
 | # | Change | Before → After | Effect |
 |---|--------|---------------|--------|
-| 1 | **Warm-up gate** | Trade immediately | HOLD until 5 predictions validated |
-| 2 | **MIN_EDGE raised** | 0.02 (2%) | 0.03 (3%) — higher bar for trading |
-| 3 | **VOL_CIRCUIT_BREAKER tightened** | 0.12 | 0.08 — hold earlier in chaotic markets |
-| 4 | **Spread gate added** | None | HOLD if spread > 0.06 |
-| 5 | **Cost estimates raised** | FIXED_COST 0.005, HALF_SPREAD 0.005 | 0.008, 0.008 — more conservative |
-| 6 | **Max drawdown gate** | None | Disable trading if rolling PnL < -15% |
-| 7 | **Second-side limit order** | Hardcoded `0.98 - firstSidePrice` | Uses actual opposite-side ask with discount, clamped |
-
-### Round 3: Regime Detection & Adaptive Logic
-
-| # | Change | Description |
-|---|--------|-------------|
-| 1 | **RegimeDetector added** | Classifies market into momentum / reversal / chop / expiry |
-| 2 | **Adaptive noise filter** | Fixed 0.02 threshold → `max(0.005, 0.01, 0.5×spread, 0.3×vol)` |
-| 3 | **Regime-conditioned triggers** | Non-pole predictions allowed in momentum (2 updates) and expiry (1 update) |
-| 4 | **Regime-conditioned EdgeCalculator** | MIN_EDGE and VOL_BREAKER vary by regime (see table in Section 10) |
-| 5 | **Chop regime block** | Forced HOLD in chop — no signal worth pursuing |
-| 6 | **Losing streak promoted** | Warning → **trading halt** at 5+ consecutive losses |
-| 7 | **Regime logged** | PricePrediction and diagnostics include `regime` field |
-
-### Round 4: Threshold Calibration & Correctness Fixes
-
-| # | Issue | Impact | Fix |
-|---|-------|--------|-----|
-| 1 | **RegimeDetector thresholds unreachable** — `MOMENTUM_TREND_THRESHOLD = 0.3` but raw EMA diff is 0.001-0.03 | Momentum regime **never** triggered; all regime logic was dead code | Recalibrated all thresholds to raw value ranges (trend: 0.01, vol floor: 0.005, chop ceiling: 0.005) |
-| 2 | **Drawdown scanned only buffer tail** — started from `scanStart` (last 20 records) not index 0 | Drawdown underestimated — could miss historical drawdown | Scan starts from 0; full buffer used |
-| 3 | **Losing streak permanently sticky** — used `maxLosingStreak` (worst-ever in buffer) | A 5-loss streak 100 predictions ago disabled trading forever | Changed to `currentLosingStreak` (active streak at buffer tail); wins reset counter |
-| 4 | **Stale comments** — "pole-only" language in updown-bot.ts | Misleading documentation alongside regime-aware code | Updated all comments to reflect regime-conditioned triggers |
-| 5 | **Hardcoded accuracy threshold** — updown-bot.ts used `0.02` for direction evaluation | Inconsistent with adaptive noise filter | Simplified to pure sign check (`priceDiff >= 0 ? "up" : "down"`) |
+| 1 | **Warm-up gate added** | Trade immediately on first prediction | HOLD until 5 predictions validated |
+| 2 | **Cold-start accuracy** | Return phantom 0.6 with no data | Return 0.5 (coin-flip, no false confidence) |
+| 3 | **MIN_EDGE raised** | 0.02 (2%) | 0.03 (3%) — higher bar for trading |
+| 4 | **VOL_CIRCUIT_BREAKER tightened** | 0.12 | 0.08 — hold earlier in chaotic markets |
+| 5 | **Spread gate added** | None | HOLD if spread > 0.06 (illiquid market) |
+| 6 | **Cost estimates raised** | FIXED_COST 0.005, HALF_SPREAD 0.005 | 0.008, 0.008 — more conservative |
+| 7 | **Max drawdown gate** | None | Disable trading if rolling PnL < -15% |
+| 8 | **Losing streak warning** | None | Warn at 5+ consecutive losses |
+| 9 | **Second-side limit order** | Hardcoded `0.98 - firstSidePrice` | Uses actual opposite-side ask with 2-cent discount, clamped so first+second < 0.98 |
+| 10 | **Health check performance** | 3 separate slice+filter passes | Single-pass scan over buffer |
 
 ### Net Safety Posture
 
 The bot now operates with a "trade reluctantly" philosophy:
 - Most predictions result in HOLD (high no-trade rate is expected and desired)
-- Four different market regimes receive tailored treatment — chop is never traded, expiry requires extra conviction
-- Trades only happen when edge is convincing (2.5-4% after cost depending on regime), volatility is calm, spread is tight, and the model has a validated track record
-- Auto-shutdown triggers exist for accuracy collapse, drawdown, and losing streaks (all three disable trading, not just warn)
-- Every prediction is logged with full context including regime for post-session analysis
+- Trades only happen when edge is convincing (3%+ after cost), volatility is calm, spread is tight, and the model has a validated track record
+- Auto-shutdown triggers exist for accuracy collapse and drawdown
+- Every prediction is logged with full context for post-session analysis

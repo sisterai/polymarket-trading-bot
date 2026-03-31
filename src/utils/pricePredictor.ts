@@ -1,18 +1,23 @@
 import { logger } from "./logger";
 import { PredictionDiagnostics } from "./diagnostics";
+import { RegimeDiagnostics } from "./regime-diagnostics";
+import {
+    MicrostructureFeatureEngine,
+    RegimeDetector as ScoreRegimeDetector,
+} from "./microstructure-regimes";
+import type { Regime, NormalizedFeatureSet, RegimeDetectionResult } from "./microstructure-regimes";
+
+// Re-export MarketSnapshot from the canonical source for all consumers.
+export type { MarketSnapshot } from "./microstructure-regimes";
+type MarketSnapshot = import("./microstructure-regimes").MarketSnapshot;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Public Types
 // ═══════════════════════════════════════════════════════════════════════════
 
-/**
- * Market regime classification.
- * - momentum:  strong directional move, trade continuations
- * - reversal:  local peak/trough, trade mean reversion
- * - chop:      low volatility / low trend, no clear direction — avoid trading
- * - expiry:    final portion of 5-min round, prices converge to 0/1 — be cautious
- */
-export type MarketRegime = "momentum" | "reversal" | "chop" | "expiry";
+// NOTE: We keep the exported name `MarketRegime` for backward compatibility,
+// but it is now the richer score-based 7-regime universe.
+export type MarketRegime = Regime;
 
 export interface PricePrediction {
     // Legacy (preserved for backward compatibility)
@@ -36,34 +41,12 @@ export interface PricePrediction {
 
     // Regime context
     regime: MarketRegime;
-}
+    regimeConfidence: number;       // bestScore from regime detection
+    regimeScoreMargin: number;      // gap between best and second-best regime scores
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Public Input Type
-// ═══════════════════════════════════════════════════════════════════════════
-
-/**
- * Rich market state snapshot passed to the predictor.
- * All fields beyond `bestAsk` and `timestamp` are optional — the predictor
- * degrades gracefully to legacy (price-only) behavior when they are null.
- */
-export interface MarketSnapshot {
-    // Always available from best_bid_ask events
-    bestAsk: number;
-    bestBid: number | null;
-    spread: number | null;          // ask - bid (from WS or computed)
-    mid: number | null;             // (bid + ask) / 2
-
-    // Available when book / price_change events are processed (future)
-    bidSize: number | null;         // top-of-book bid quantity
-    askSize: number | null;         // top-of-book ask quantity
-
-    // Cross-leg context (from the bot's view of both UP and DOWN tokens)
-    downAsk: number | null;
-
-    // Timing
-    timestamp: number;
-    roundStartTime: number | null;  // ms epoch of current 5-min round start
+    // Safety gate output
+    blockedBySafetyGate?: boolean;  // true if a hard safety gate blocked the trade
+    safetyBlockReason?: string;     // human-readable reason for the block
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -209,86 +192,6 @@ class PoleDetector {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// RegimeDetector
-// Classifies market state into one of four regimes using lightweight
-// indicators derived from the price buffer and snapshot timing.
-//
-// Regimes:
-//   momentum  — strong directional move; allow continuation trades
-//   reversal  — local extremum detected; classic pole-based entry
-//   chop      — low volatility, no clear trend; avoid trading
-//   expiry    — final portion of 5-min round; book may be distorted
-//
-// The detected regime conditions both the prediction trigger
-// (pole-only vs momentum bypass) and the edge threshold in EdgeCalculator.
-// ═══════════════════════════════════════════════════════════════════════════
-
-class RegimeDetector {
-    // Expiry: fraction of round elapsed above which we switch to expiry regime.
-    // 0.85 = last 45 seconds of a 5-min round.
-    private static readonly EXPIRY_THRESHOLD = 0.85;
-
-    // ── Value ranges for a token priced 0.40-0.60 ──
-    //
-    // rawTrend = emaShort - emaLong:  typical range [-0.03, +0.03]
-    // rawMomentum = (cur - lag1)/lag1: typical range [-0.10, +0.10]
-    // rawVolatility = std dev of ~5 prices: typical range [0.003, 0.03]
-    //
-    // Thresholds must be calibrated to these RAW ranges, not feature-space.
-
-    // Momentum: strong directional move.
-    // |EMA trend| > 0.01 means short EMA is diverging from long EMA.
-    private static readonly MOMENTUM_TREND_THRESHOLD = 0.01;
-    // |momentum| > 2% rate of change.
-    private static readonly MOMENTUM_MOM_THRESHOLD = 0.02;
-    // Std dev > 0.005 confirms the move involves actual price variation.
-    private static readonly MOMENTUM_VOL_FLOOR = 0.005;
-
-    // Chop: flat, ranging market — no directional signal.
-    // Std dev < 0.005 = prices barely moving.
-    private static readonly CHOP_VOL_CEILING = 0.005;
-    // |EMA trend| < 0.003 = EMAs are basically flat.
-    private static readonly CHOP_TREND_CEILING = 0.003;
-    // |momentum| < 1% = no meaningful recent move.
-    private static readonly CHOP_MOM_CEILING = 0.01;
-
-    /**
-     * Classify market regime from pre-computed indicators.
-     *
-     * @param momentum  raw: (cur - lag1) / lag1, typically [-0.10, +0.10]
-     * @param volatility  raw: std dev of recent smoothed prices, typically [0.003, 0.03]
-     * @param trend  raw: emaShort - emaLong, typically [-0.03, +0.03]
-     * @param timeRemaining  fraction of round elapsed [0, 1], or null
-     */
-    detect(momentum: number, volatility: number, trend: number, timeRemaining: number | null): MarketRegime {
-        // Late-stage expiry takes priority — book behavior changes fundamentally.
-        if (timeRemaining !== null && timeRemaining > RegimeDetector.EXPIRY_THRESHOLD) {
-            return "expiry";
-        }
-
-        const absTrend = Math.abs(trend);
-        const absMom = Math.abs(momentum);
-
-        // Momentum: strong directional conviction from both trend and momentum.
-        if (absTrend > RegimeDetector.MOMENTUM_TREND_THRESHOLD &&
-            volatility > RegimeDetector.MOMENTUM_VOL_FLOOR &&
-            absMom > RegimeDetector.MOMENTUM_MOM_THRESHOLD) {
-            return "momentum";
-        }
-
-        // Chop: flat, low-energy market — nothing to trade.
-        if (volatility < RegimeDetector.CHOP_VOL_CEILING &&
-            absTrend < RegimeDetector.CHOP_TREND_CEILING &&
-            absMom < RegimeDetector.CHOP_MOM_CEILING) {
-            return "chop";
-        }
-
-        // Default: reversal (pole-based entry logic).
-        return "reversal";
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
 // FeatureExtractor
 // Owns EMA state and normalization statistics.
 // Extracts a 12-dimensional feature vector from price history + snapshot.
@@ -417,8 +320,10 @@ class FeatureExtractor {
      * Cap at 0.5 (50 cents on a [0,1] market) — beyond that is degenerate.
      */
     private computeSpread(snap: MarketSnapshot | null): number {
-        if (!snap || snap.spread === null) return 0;
-        return clamp(snap.spread / 0.5, 0, 1);
+        if (!snap) return 0;
+        const spread = Math.max(snap.bestAsk - snap.bestBid, 0);
+        if (spread === 0) return 0;
+        return clamp(spread / 0.5, 0, 1);
     }
 
     /**
@@ -429,20 +334,12 @@ class FeatureExtractor {
      */
     private computeMicroprice(snap: MarketSnapshot | null): number {
         if (!snap) return 0.5;
-
-        let rawMicroprice: number;
-        if (snap.bidSize !== null && snap.askSize !== null &&
-            snap.bestBid !== null && snap.bestAsk > 0 &&
-            (snap.bidSize + snap.askSize) > 0) {
-            rawMicroprice = (snap.bestBid * snap.askSize + snap.bestAsk * snap.bidSize)
-                            / (snap.bidSize + snap.askSize);
-        } else if (snap.mid !== null) {
-            rawMicroprice = snap.mid;
-        } else {
-            return 0.5;
+        const totalSize = snap.bestBidSize + snap.bestAskSize;
+        if (totalSize > 0) {
+            const raw = (snap.bestBid * snap.bestAskSize + snap.bestAsk * snap.bestBidSize) / totalSize;
+            return this.normalizePrice(raw);
         }
-
-        return this.normalizePrice(rawMicroprice);
+        return this.normalizePrice((snap.bestBid + snap.bestAsk) / 2);
     }
 
     /**
@@ -451,10 +348,10 @@ class FeatureExtractor {
      * Neutral (0) when sizes are unavailable.
      */
     private computeBookImbalance(snap: MarketSnapshot | null): number {
-        if (!snap || snap.bidSize === null || snap.askSize === null) return 0;
-        const total = snap.bidSize + snap.askSize;
+        if (!snap) return 0;
+        const total = snap.bestBidSize + snap.bestAskSize;
         if (total <= 0) return 0;
-        return clamp((snap.bidSize - snap.askSize) / total, -1, 1);
+        return clamp((snap.bestBidSize - snap.bestAskSize) / total, -1, 1);
     }
 
     /**
@@ -464,7 +361,7 @@ class FeatureExtractor {
      * Normalized by dividing by 0.1 (typical max deviation) and clamped to [-1, 1].
      */
     private computeDownAskDelta(snap: MarketSnapshot | null): number {
-        if (!snap || snap.downAsk === null) return 0;
+        if (!snap || snap.downAsk == null) return 0;
         const fairUp = 1 - snap.downAsk;
         const delta = snap.bestAsk - fairUp;
         return clamp(delta / 0.1, -1, 1);
@@ -476,7 +373,7 @@ class FeatureExtractor {
      * As expiry approaches, prices converge to 0 or 1.
      */
     private computeTimeRemaining(snap: MarketSnapshot | null): number {
-        if (!snap || snap.roundStartTime === null) return 0.5;
+        if (!snap || snap.roundStartTime == null) return 0.5;
         const elapsed = snap.timestamp - snap.roundStartTime;
         return clamp(elapsed / FeatureExtractor.ROUND_DURATION_MS, 0, 1);
     }
@@ -545,8 +442,9 @@ class FeatureExtractor {
      * Called on every accepted update to track spread for adaptive noise filter.
      */
     trackSpread(snap: MarketSnapshot): void {
-        if (snap.spread !== null) {
-            this._lastSpread = snap.spread;
+        const spread = snap.bestAsk - snap.bestBid;
+        if (spread >= 0) {
+            this._lastSpread = spread;
         }
     }
 
@@ -583,42 +481,58 @@ interface EdgeDecision {
     confidence: number;
     signal: "BUY_UP" | "BUY_DOWN" | "HOLD";
     rawScore: number;
+    blockedBySafetyGate: boolean;
+    safetyBlockReason?: string;
 }
 
 class EdgeCalculator {
     private static readonly SIGMOID_SENSITIVITY = 15;
     private static readonly FIXED_COST = 0.008;
     private static readonly DEFAULT_HALF_SPREAD = 0.008;
-    private static readonly MAX_SPREAD_TO_TRADE = 0.06;
     private static readonly WARMUP_MIN_RESOLVED = 5;
 
-    // Regime-conditioned edge thresholds.
-    // Momentum: slightly lower — model has directional conviction and we want to capture continuations.
-    // Reversal: standard — classic pole-based trade, needs clear edge.
-    // Chop: never trade (forced HOLD).
-    // Expiry: higher — book distortion near expiry, need stronger conviction.
-    private static readonly MIN_EDGE_MOMENTUM = 0.025;
-    private static readonly MIN_EDGE_REVERSAL = 0.03;
-    private static readonly MIN_EDGE_EXPIRY = 0.04;
+    // ── Regime-conditioned edge thresholds ──
+    // flow_dominance: strongest continuation, lowest bar
+    // momentum: moderate continuation
+    // breakout: needs more conviction (compression-release is noisy)
+    // reversal: highest bar for directional (fades are inherently riskier)
+    // expiry: very high bar (book distortion near expiry)
+    private static readonly MIN_EDGE_FLOW_DOMINANCE = 0.020;
+    private static readonly MIN_EDGE_MOMENTUM       = 0.025;
+    private static readonly MIN_EDGE_BREAKOUT        = 0.030;
+    private static readonly MIN_EDGE_REVERSAL        = 0.035;
+    private static readonly MIN_EDGE_EXPIRY          = 0.045;
 
     // Volatility circuit breaker — regime-conditioned.
-    // Momentum allows higher volatility (it IS the regime).
-    // Expiry is stricter — chaotic near expiry is dangerous.
-    private static readonly VOL_BREAKER_MOMENTUM = 0.12;
-    private static readonly VOL_BREAKER_REVERSAL = 0.08;
-    private static readonly VOL_BREAKER_EXPIRY = 0.06;
+    private static readonly VOL_BREAKER_AGGRESSIVE  = 0.12;  // flow_dominance, breakout
+    private static readonly VOL_BREAKER_MODERATE    = 0.10;  // momentum
+    private static readonly VOL_BREAKER_REVERSAL    = 0.08;  // reversal
+    private static readonly VOL_BREAKER_EXPIRY      = 0.06;  // expiry
+
+    // Hard safety gates (from RegimeDetectorConfig defaults).
+    // These exist to prevent directional trading when the orderbook
+    // environment is structurally unsafe, regardless of model edge.
+    private static readonly MAX_SPREAD_PCT_GATE     = 0.08;
+    private static readonly MIN_DEPTH_RANK_GATE     = 0.25;
+    private static readonly MIN_REGIME_CONFIDENCE    = 0.70;
+    private static readonly MIN_SCORE_MARGIN         = 0.10;
 
     compute(params: {
         predictedPrice: number;
         currentPrice: number;
         rawScore: number;
         features: FeatureVector;
-        snapshot: MarketSnapshot | null;
+        snapshot: MarketSnapshot;
         recentAccuracy: number;
         resolvedCount: number;
-        regime: MarketRegime;
+        regimeResult: RegimeDetectionResult;
+        microFeatures: NormalizedFeatureSet | null;
     }): EdgeDecision {
-        const { predictedPrice, currentPrice, rawScore, features, snapshot, recentAccuracy, resolvedCount, regime } = params;
+        const {
+            predictedPrice, currentPrice, rawScore, features, snapshot,
+            recentAccuracy, resolvedCount, regimeResult, microFeatures,
+        } = params;
+        const regime = regimeResult.regime;
 
         // ── 1. Predicted move → probability via sigmoid ──
         const delta = predictedPrice - currentPrice;
@@ -626,14 +540,13 @@ class EdgeCalculator {
         const pDown = 1 - pUp;
 
         // ── 2. Execution cost estimate ──
-        const halfSpread = snapshot?.spread !== null && snapshot?.spread !== undefined
-            ? snapshot.spread / 2
-            : EdgeCalculator.DEFAULT_HALF_SPREAD;
+        const computedSpread = Math.max(snapshot.bestAsk - snapshot.bestBid, 0);
+        const halfSpread = computedSpread > 0 ? computedSpread / 2 : EdgeCalculator.DEFAULT_HALF_SPREAD;
         const costPerShare = Math.max(0, halfSpread) + EdgeCalculator.FIXED_COST;
 
         // ── 3. Edge per side ──
-        const upAsk = snapshot?.bestAsk ?? currentPrice;
-        const downAsk = snapshot?.downAsk ?? (1 - currentPrice);
+        const upAsk = snapshot.bestAsk;
+        const downAsk = snapshot.downAsk ?? (1 - currentPrice);
         const edgeBuyUp = pUp - upAsk - costPerShare;
         const edgeBuyDown = pDown - downAsk - costPerShare;
 
@@ -648,50 +561,132 @@ class EdgeCalculator {
         const accuracyFactor = recentAccuracy >= 0.5 ? 1.0 : 0.5 + recentAccuracy;
         const adjustedEdge = bestEdge * accuracyFactor;
 
-        // ── 7. Regime-conditioned signal gating ──
-        let signal: "BUY_UP" | "BUY_DOWN" | "HOLD";
+        // ── 7. Regime-aware signal gating ──
+        // Override regimes MUST block weaker directional regimes.
+        // Rationale: liquidity_vacuum and expiry represent structural market
+        // conditions where the orderbook cannot be trusted. A directional
+        // signal computed from features that assume a functioning book is
+        // meaningless — or worse, dangerous.
+        let signal: "BUY_UP" | "BUY_DOWN" | "HOLD" = "HOLD";
+        let blockedBySafetyGate = false;
+        let safetyBlockReason: string | undefined;
 
-        // Chop regime → never trade, no signal worth pursuing.
         if (regime === "chop") {
-            signal = "HOLD";
+            // No directional edge in chop — stay flat.
+            safetyBlockReason = "chop: no directional edge";
+            blockedBySafetyGate = true;
+        } else if (regime === "liquidity_vacuum") {
+            // Thin book → toxic conditions; aggressive orders get adversely filled.
+            safetyBlockReason = "liquidity_vacuum: orderbook too thin for directional trading";
+            blockedBySafetyGate = true;
+        } else if (regime === "expiry") {
+            // Expiry: only allow trading if edge is exceptional.
+            // Near round-end, prices converge to 0/1 and book distortion is common.
+            if (adjustedEdge < EdgeCalculator.MIN_EDGE_EXPIRY) {
+                safetyBlockReason = `expiry: edge ${adjustedEdge.toFixed(4)} < ${EdgeCalculator.MIN_EDGE_EXPIRY}`;
+                blockedBySafetyGate = true;
+            } else if (features.volatility > EdgeCalculator.VOL_BREAKER_EXPIRY) {
+                safetyBlockReason = `expiry: volatility ${features.volatility.toFixed(4)} exceeds circuit breaker`;
+                blockedBySafetyGate = true;
+            }
         } else if (resolvedCount < EdgeCalculator.WARMUP_MIN_RESOLVED) {
-            signal = "HOLD";
-        } else if (snapshot?.spread !== null && snapshot?.spread !== undefined &&
-                   snapshot.spread > EdgeCalculator.MAX_SPREAD_TO_TRADE) {
-            signal = "HOLD";
+            safetyBlockReason = `warmup: only ${resolvedCount} resolved predictions`;
+            blockedBySafetyGate = true;
         } else {
-            // Select regime-appropriate thresholds
-            const volBreaker = regime === "momentum" ? EdgeCalculator.VOL_BREAKER_MOMENTUM
-                             : regime === "expiry"   ? EdgeCalculator.VOL_BREAKER_EXPIRY
-                             :                         EdgeCalculator.VOL_BREAKER_REVERSAL;
-
-            const minEdge = regime === "momentum" ? EdgeCalculator.MIN_EDGE_MOMENTUM
-                          : regime === "expiry"   ? EdgeCalculator.MIN_EDGE_EXPIRY
-                          :                         EdgeCalculator.MIN_EDGE_REVERSAL;
-
-            if (features.volatility > volBreaker) {
-                signal = "HOLD";
-            } else if (adjustedEdge >= minEdge) {
-                signal = direction === "up" ? "BUY_UP" : "BUY_DOWN";
+            // ── Hard safety gates for directional regimes ──
+            const gateResult = this.checkSafetyGates(regimeResult, microFeatures, computedSpread);
+            if (gateResult) {
+                safetyBlockReason = gateResult;
+                blockedBySafetyGate = true;
             } else {
-                signal = "HOLD";
+                // ── Per-regime edge & volatility thresholds ──
+                const { minEdge, volBreaker } = this.regimeThresholds(regime);
+
+                if (features.volatility > volBreaker) {
+                    safetyBlockReason = `${regime}: volatility ${features.volatility.toFixed(4)} exceeds circuit breaker`;
+                } else if (adjustedEdge >= minEdge) {
+                    signal = direction === "up" ? "BUY_UP" : "BUY_DOWN";
+                } else {
+                    safetyBlockReason = `${regime}: edge ${adjustedEdge.toFixed(4)} < ${minEdge}`;
+                }
             }
         }
 
-        return { pUp, pDown, edgeBuyUp, edgeBuyDown, direction, confidence, signal, rawScore };
+        // If we still have a trade signal and expiry forced HOLD, override above already handled it.
+        // If the regime allowed trading and all gates passed, signal was set above.
+
+        return {
+            pUp, pDown, edgeBuyUp, edgeBuyDown, direction, confidence, signal, rawScore,
+            blockedBySafetyGate, safetyBlockReason,
+        };
+    }
+
+    /**
+     * Hard safety gates applied to all directional regimes.
+     * Returns a reason string if blocked, or null if clear.
+     */
+    private checkSafetyGates(
+        regimeResult: RegimeDetectionResult,
+        micro: NormalizedFeatureSet | null,
+        rawSpread: number,
+    ): string | null {
+        // Raw spread check (absolute gate, always available)
+        if (rawSpread > EdgeCalculator.MAX_SPREAD_PCT_GATE) {
+            return `spread ${rawSpread.toFixed(4)} > max ${EdgeCalculator.MAX_SPREAD_PCT_GATE}`;
+        }
+
+        // Regime confidence and margin gates
+        if (regimeResult.bestScore < EdgeCalculator.MIN_REGIME_CONFIDENCE) {
+            return `regime confidence ${regimeResult.bestScore.toFixed(3)} < ${EdgeCalculator.MIN_REGIME_CONFIDENCE}`;
+        }
+        if (regimeResult.scoreMargin < EdgeCalculator.MIN_SCORE_MARGIN) {
+            return `score margin ${regimeResult.scoreMargin.toFixed(3)} < ${EdgeCalculator.MIN_SCORE_MARGIN}`;
+        }
+
+        // Depth rank gate (requires microstructure features)
+        if (micro && micro.pctTotalDepth < EdgeCalculator.MIN_DEPTH_RANK_GATE) {
+            return `depth rank ${micro.pctTotalDepth.toFixed(3)} < ${EdgeCalculator.MIN_DEPTH_RANK_GATE}`;
+        }
+
+        return null;
+    }
+
+    /**
+     * Per-regime edge and volatility thresholds.
+     * flow_dominance → most aggressive (strongest signal)
+     * momentum       → moderate
+     * breakout       → tighter (noisy signal, needs conviction)
+     * reversal       → most conservative (fading is risky)
+     */
+    private regimeThresholds(regime: MarketRegime): { minEdge: number; volBreaker: number } {
+        switch (regime) {
+            case "flow_dominance":
+                return { minEdge: EdgeCalculator.MIN_EDGE_FLOW_DOMINANCE, volBreaker: EdgeCalculator.VOL_BREAKER_AGGRESSIVE };
+            case "momentum":
+                return { minEdge: EdgeCalculator.MIN_EDGE_MOMENTUM, volBreaker: EdgeCalculator.VOL_BREAKER_MODERATE };
+            case "breakout":
+                return { minEdge: EdgeCalculator.MIN_EDGE_BREAKOUT, volBreaker: EdgeCalculator.VOL_BREAKER_AGGRESSIVE };
+            case "reversal":
+                return { minEdge: EdgeCalculator.MIN_EDGE_REVERSAL, volBreaker: EdgeCalculator.VOL_BREAKER_REVERSAL };
+            case "expiry":
+                return { minEdge: EdgeCalculator.MIN_EDGE_EXPIRY, volBreaker: EdgeCalculator.VOL_BREAKER_EXPIRY };
+            default:
+                return { minEdge: EdgeCalculator.MIN_EDGE_REVERSAL, volBreaker: EdgeCalculator.VOL_BREAKER_REVERSAL };
+        }
     }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // AdaptivePricePredictor (Orchestrator)
 // Owns the price buffer, adaptive noise filter, model weights, and
-// accuracy history. Delegates to five components:
-//   PoleDetector, RegimeDetector, FeatureExtractor, EdgeCalculator, Diagnostics
+// accuracy history. Delegates to six components:
+//   PoleDetector, MicrostructureFeatureEngine, ScoreRegimeDetector,
+//   FeatureExtractor, EdgeCalculator, Diagnostics
 //
 // Prediction trigger is regime-conditioned:
-//   reversal/chop → pole-only
-//   momentum      → pole OR 2+ updates since last prediction
-//   expiry        → pole OR 1+ update since last prediction
+//   reversal/chop         → pole-only
+//   momentum/flow_dominance/breakout → pole OR 2+ updates since last prediction
+//   expiry                → pole OR 1+ update since last prediction
 // ═══════════════════════════════════════════════════════════════════════════
 
 export class AdaptivePricePredictor {
@@ -754,10 +749,16 @@ export class AdaptivePricePredictor {
 
     // ── Components ──
     private readonly poles = new PoleDetector();
-    private readonly regimes = new RegimeDetector();
+    private readonly microstructure = new MicrostructureFeatureEngine({ normalizationWindowEvents: 200, localRangeWindowEvents: 50 });
+    private readonly scoreRegimes = new ScoreRegimeDetector();
     private readonly extractor = new FeatureExtractor();
     private readonly edge = new EdgeCalculator();
     private readonly diagnostics = new PredictionDiagnostics();
+    private readonly regimeDiag = new RegimeDiagnostics();
+
+    // Latest microstructure features (updated on every accepted event)
+    private latestMicroFeatures: NormalizedFeatureSet | null = null;
+    private latestRegimeResult: RegimeDetectionResult | null = null;
 
     // ─────────────────────────────────────────────────────────────────────
 
@@ -768,14 +769,10 @@ export class AdaptivePricePredictor {
     public updateAndPredict(price: number, timestamp: number): PricePrediction | null {
         const minimalSnapshot: MarketSnapshot = {
             bestAsk: price,
-            bestBid: null,
-            spread: null,
-            mid: null,
-            bidSize: null,
-            askSize: null,
-            downAsk: null,
+            bestBid: price,
+            bestBidSize: 0,
+            bestAskSize: 0,
             timestamp,
-            roundStartTime: null,
         };
         return this.updateAndPredictWithSnapshot(minimalSnapshot);
     }
@@ -844,26 +841,36 @@ export class AdaptivePricePredictor {
         // ── Gate: minimum history ──
         if (this.priceHistory.length < 3) return null;
 
-        // ── Regime detection (lightweight, before pole gate) ──
-        const rawMomentum = this.extractor.getRecentMomentum(this.priceHistory);
-        const rawVolatility = this.extractor.getRecentVolatility(this.priceHistory);
-        const rawTrend = this.extractor.getEmaTrend();
-        const timeRemaining = this.computeTimeRemaining(snapshot);
-        const regime = this.regimes.detect(rawMomentum, rawVolatility, rawTrend, timeRemaining);
+        // ── Regime detection (score-based, before pole gate) ──
+        // Update microstructure engine on every accepted event so rolling
+        // features are always current when a prediction trigger fires.
+        this.latestMicroFeatures = this.microstructure.update(snapshot);
+
+        // Score-based regime detection using normalized microstructure features.
+        this.latestRegimeResult = this.scoreRegimes.detect(this.latestMicroFeatures);
+        const regime = this.latestRegimeResult.regime;
+
+        // Record every classification event for regime-level diagnostics.
+        this.regimeDiag.record({
+            features: this.latestMicroFeatures,
+            result: this.latestRegimeResult,
+            timestamp,
+        });
 
         // ── Gate: prediction trigger (regime-conditioned) ──
         //
-        // Reversal regime: only at pole detections (classic behavior).
-        // Momentum regime: also triggers on strong directional moves between poles
-        //                  (after at least 2 accepted updates since last prediction).
-        // Expiry regime:   triggers more frequently (after 1 update since last prediction).
+        // Reversal/chop regime: only at pole detections (classic behavior).
+        // Directional regimes (momentum, flow_dominance, breakout): also trigger
+        //   on strong moves between poles (after 2+ accepted updates).
+        // Expiry regime: triggers more frequently (after 1 update since last prediction).
         // Chop regime:     only at poles — but EdgeCalculator will force HOLD anyway.
         //
         const isPole = this.poles.detect(this.priceHistory, timestamp, adaptiveThreshold);
         let shouldPredict = isPole;
 
         if (!isPole) {
-            if (regime === "momentum" && this.updatesSinceLastPrediction >= 2) {
+            const isDirectionalRegime = regime === "momentum" || regime === "flow_dominance" || regime === "breakout";
+            if (isDirectionalRegime && this.updatesSinceLastPrediction >= 2) {
                 shouldPredict = true;
             } else if (regime === "expiry" && this.updatesSinceLastPrediction >= 1) {
                 shouldPredict = true;
@@ -910,7 +917,8 @@ export class AdaptivePricePredictor {
             snapshot,
             recentAccuracy,
             resolvedCount: this.recentPredictions.length,
-            regime,
+            regimeResult: this.latestRegimeResult!,
+            microFeatures: this.latestMicroFeatures,
         });
 
         // ── Step 6: Store current prediction as pending ──
@@ -939,10 +947,18 @@ export class AdaptivePricePredictor {
             edgeBuyDown: decision.edgeBuyDown,
             rawScore: decision.rawScore,
             regime,
+            regimeConfidence: this.latestRegimeResult!.bestScore,
+            regimeScoreMargin: this.latestRegimeResult!.scoreMargin,
+            blockedBySafetyGate: decision.blockedBySafetyGate || undefined,
+            safetyBlockReason: decision.safetyBlockReason,
         };
 
         // ── Step 7: Record for diagnostics ──
         this.diagnostics.record(result, snapshot, currentPrice);
+        this.regimeDiag.recordPrediction(
+            decision.signal, decision.edgeBuyUp, decision.edgeBuyDown,
+            regime, decision.safetyBlockReason,
+        );
 
         // ── Timing guard ──
         const elapsed = Date.now() - t0;
@@ -955,7 +971,7 @@ export class AdaptivePricePredictor {
 
     /** Compute time remaining fraction from snapshot, or null if unavailable. */
     private computeTimeRemaining(snapshot: MarketSnapshot): number | null {
-        if (snapshot.roundStartTime === null) return null;
+        if (snapshot.roundStartTime == null) return null;
         const elapsed = snapshot.timestamp - snapshot.roundStartTime;
         return clamp(elapsed / (5 * 60 * 1000), 0, 1);
     }
@@ -1071,6 +1087,9 @@ export class AdaptivePricePredictor {
 
         // Record outcome for diagnostics
         this.diagnostics.resolve(outcomePrice, Date.now());
+        if (correct || wrong) {
+            this.regimeDiag.recordResolution(correct);
+        }
 
         this.pending = null;
     }
@@ -1099,6 +1118,10 @@ export class AdaptivePricePredictor {
         return this.diagnostics;
     }
 
+    public getRegimeDiagnostics(): RegimeDiagnostics {
+        return this.regimeDiag;
+    }
+
     public reset(): void {
         this.priceHistory = [];
         this.timestamps = [];
@@ -1110,7 +1133,11 @@ export class AdaptivePricePredictor {
         // and the outcome will never arrive in the new cycle.
         this.pending = null;
         this.poles.reset();
+        this.microstructure.reset();
+        this.scoreRegimes.reset();
         this.extractor.reset();
+        this.latestMicroFeatures = null;
+        this.latestRegimeResult = null;
         // Weights + accuracy tracking intentionally preserved across market cycles
     }
 }

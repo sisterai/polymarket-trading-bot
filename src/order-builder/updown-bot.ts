@@ -399,17 +399,23 @@ export class UpDownPredictionBot {
                 this.pricePredictors.set(market, predictor);
             }
 
-            // Build rich snapshot from available WebSocket data
+            // Build rich snapshot from available WebSocket data.
+            // Event-time features prefer orderbook/flow state over price-only transforms.
+            const nowTs = Date.now();
+            const roundStart = current5mSlotStartMs();
+            const roundEnd = roundStart + 5 * 60 * 1000;
             const snapshot: MarketSnapshot = {
+                bestBid: upPrice.bestBid ?? upAsk,
                 bestAsk: upAsk,
-                bestBid: upPrice.bestBid,
-                spread: upPrice.spread,
-                mid: upPrice.mid,
-                bidSize: null,   // TODO: populate when book events are parsed
-                askSize: null,   // TODO: populate when book events are parsed
+                bestBidSize: 0, // TODO: populate from top-of-book size stream
+                bestAskSize: 0, // TODO: populate from top-of-book size stream
+                bidDepthTop3: undefined, // TODO: populate from orderbook depth events
+                askDepthTop3: undefined, // TODO: populate from orderbook depth events
+                timestamp: nowTs,
+                recentEventCount: 1,
+                roundEndTimestamp: roundEnd,
                 downAsk: downAsk,
-                timestamp: Date.now(),
-                roundStartTime: current5mSlotStartMs(),
+                roundStartTime: roundStart,
             };
 
             // Returns a prediction when a trigger fires (pole, momentum, or expiry regime)
@@ -445,7 +451,7 @@ export class UpDownPredictionBot {
 
             const bestEdge = Math.max(prediction.edgeBuyUp, prediction.edgeBuyDown);
             const triggerType = prediction.isPoleValue ? "POLE" : prediction.regime.toUpperCase();
-            logger.info(`🔮 PREDICT [${triggerType}]: regime=${prediction.regime} | pUp=${prediction.pUp.toFixed(3)} | Edge=${(bestEdge * 100).toFixed(1)}% | Dir: ${prediction.direction.toUpperCase()} | Signal: ${prediction.signal} | Pred: ${prediction.predictedPrice.toFixed(4)} (cur: ${upAsk.toFixed(4)}) | Mom: ${prediction.features.momentum.toFixed(3)} | Vol: ${prediction.features.volatility.toFixed(3)} | Trend: ${prediction.features.trend.toFixed(3)}`);
+            logger.info(`🔮 PREDICT [${triggerType}]: regime=${prediction.regime} (conf=${prediction.regimeConfidence.toFixed(2)}, margin=${prediction.regimeScoreMargin.toFixed(2)}) | pUp=${prediction.pUp.toFixed(3)} | Edge=${(bestEdge * 100).toFixed(1)}% | Dir: ${prediction.direction.toUpperCase()} | Signal: ${prediction.signal}${prediction.blockedBySafetyGate ? ` [BLOCKED: ${prediction.safetyBlockReason}]` : ""} | Pred: ${prediction.predictedPrice.toFixed(4)} (cur: ${upAsk.toFixed(4)})`);
 
             // Execute prediction-based trading strategy
             this.executePredictionTrade(market, slug, prediction, upAsk, downAsk, currentTokenIds);
@@ -456,6 +462,14 @@ export class UpDownPredictionBot {
                 (diagStats.totalPredictions % 25 === 0 ||
                  [10, 50, 100, 200, 500, 1000].includes(diagStats.totalPredictions))) {
                 logger.info(predictor.getDiagnostics().formatStatsLog());
+            }
+
+            // Log regime diagnostics at lower frequency (event-driven, not prediction-driven)
+            const regimeStats = predictor.getRegimeDiagnostics().getStats();
+            if (regimeStats.totalEvents > 0 &&
+                (regimeStats.totalEvents % 100 === 0 ||
+                 [50, 200, 500, 1000].includes(regimeStats.totalEvents))) {
+                logger.info(predictor.getRegimeDiagnostics().formatStatsLog());
             }
 
             // Update previous UP ask price (always update for next comparison)
@@ -1010,6 +1024,12 @@ export class UpDownPredictionBot {
             const stats = diag.getStats();
             if (stats.totalPredictions > 0) {
                 logger.info(`\n📊 DIAGNOSTICS SUMMARY [${market}]:\n${diag.formatStatsLog()}`);
+            }
+
+            const regimeDiag = predictor.getRegimeDiagnostics();
+            const regimeStats = regimeDiag.getStats();
+            if (regimeStats.totalEvents > 0) {
+                logger.info(`\n📊 REGIME DIAGNOSTICS [${market}]:\n${regimeDiag.formatStatsLog()}`);
             }
         }
     }

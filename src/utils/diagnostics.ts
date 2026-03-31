@@ -36,6 +36,10 @@ export interface PredictionRecord {
 
     // Market regime at prediction time
     regime: MarketRegime;
+    regimeConfidence: number;
+    regimeScoreMargin: number;
+    blockedBySafetyGate?: boolean;
+    safetyBlockReason?: string;
 }
 
 export interface ResolvedRecord extends PredictionRecord {
@@ -114,8 +118,8 @@ export class PredictionDiagnostics {
             id: this.seqCounter++,
             timestamp: snapshot.timestamp,
             upAsk: snapshot.bestAsk,
-            downAsk: snapshot.downAsk,
-            spread: snapshot.spread,
+            downAsk: snapshot.downAsk ?? null,
+            spread: Math.max(snapshot.bestAsk - snapshot.bestBid, 0),
             predictedPrice: prediction.predictedPrice,
             rawScore: prediction.rawScore,
             pUp: prediction.pUp,
@@ -130,6 +134,10 @@ export class PredictionDiagnostics {
             trend: prediction.features.trend,
             basePrice,
             regime: prediction.regime,
+            regimeConfidence: prediction.regimeConfidence,
+            regimeScoreMargin: prediction.regimeScoreMargin,
+            blockedBySafetyGate: prediction.blockedBySafetyGate,
+            safetyBlockReason: prediction.safetyBlockReason,
         };
 
         this.pending = rec;
@@ -388,7 +396,7 @@ export class PredictionDiagnostics {
     // ── Helpers ────────────────────────────────────────────────────────
 
     private formatRegimeCounts(): string {
-        const counts: Record<string, number> = { momentum: 0, reversal: 0, chop: 0, expiry: 0 };
+        const counts: Record<string, number> = { flow_dominance: 0, momentum: 0, breakout: 0, reversal: 0, liquidity_vacuum: 0, expiry: 0, chop: 0 };
         for (const r of this.resolved) {
             counts[r.regime] = (counts[r.regime] ?? 0) + 1;
         }
