@@ -1,19 +1,19 @@
 # Polymarket Up/Down Prediction Trading Bot
 
-**Polymarket prediction trading bot** for automated 15-minute Up/Down crypto market trading. Uses the CLOB API, WebSocket orderbook, and an adaptive price predictor to place directional + hedge paired trades.
+**Polymarket prediction trading bot** for automated **5-minute BTC Up/Down** pool trading. Uses the CLOB API, WebSocket orderbook, and an adaptive price predictor to place directional + hedge paired trades.
 
 ---
 
 
 ## What this bot does
 
-Automated **Polymarket** trading on **15-minute Up/Down markets** (BTC, ETH, SOL, etc.). It uses an adaptive price predictor to detect price poles (peaks/troughs), predict direction, then places a first-side limit order at best ask and a second-side hedge at `0.98 − firstSidePrice`. Built with TypeScript and Polymarket's CLOB API.
+Automated **Polymarket** trading on **BTC 5-minute Up/Down pools**. It uses an adaptive price predictor to detect price poles (peaks/troughs), predict direction, then places a first-side limit order at best ask and a second-side hedge at `0.98 − firstSidePrice`. Built with TypeScript and Polymarket's CLOB API.
 
 
 ## Overview
 
 - **Strategy**: Predict Up/Down from live orderbook via an adaptive price predictor; buy the predicted side at best ask (GTC), then place the opposite side at `0.98 − firstSidePrice` (GTC).
-- **Markets**: Configurable list (e.g. `btc`, `eth`); slugs are resolved as `{market}-updown-15m-{startOf15mUnix}` via Polymarket Gamma API.
+- **Market**: Fixed to `btc`; slugs are resolved as `btc-updown-5m-{startOf5mUnix}` via Polymarket Gamma API.
 - **Stack**: TypeScript, Node (or Bun), `@polymarket/clob-client`, WebSocket orderbook, Ethers.js for allowances/redemption.
 
 ## Requirements
@@ -32,7 +32,7 @@ npm install
 
 ## Configuration
 
-Copy the example env and set at least `PRIVATE_KEY` and `TRADING_MARKETS`:
+Copy the example env and set at least `PRIVATE_KEY`:
 
 ```bash
 cp .env.temp .env
@@ -41,11 +41,10 @@ cp .env.temp .env
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `PRIVATE_KEY` | Wallet private key | **required** |
-| `TRADING_MARKETS` | Comma-separated markets (e.g. `btc`) | `btc` |
 | `TRADING_SHARES` | Shares per side per trade | `5` |
 | `TRADING_TICK_SIZE` | Price precision | `0.01` |
 | `TRADING_PRICE_BUFFER` | Price buffer for execution | `0` |
-| `TRADING_WAIT_FOR_NEXT_MARKET_START` | Wait for next 15m boundary before starting | `false` |
+| `TRADING_WAIT_FOR_NEXT_MARKET_START` | Wait for next 5m boundary before starting | `false` |
 | `TRADING_MAX_BUY_COUNTS_PER_SIDE` | Max buys per side per market (0 = no cap) | `0` |
 | `CHAIN_ID` | Chain ID (Polygon) | `137` |
 | `CLOB_API_URL` | Polymarket CLOB API base URL | `https://clob.polymarket.com` |
@@ -92,7 +91,7 @@ bun --watch src/index.ts
 |------|------|
 | `src/index.ts` | Entry: credentials, CLOB, allowances, min balance, start `UpDownPredictionBot`. |
 | `src/config/index.ts` | Loads `.env` and exposes config (chain, CLOB, trading, logging). |
-| `src/order-builder/updown-bot.ts` | **UpDownPredictionBot**: 15m slug resolution, WebSocket orderbook, predictor → first-side buy + second-side hedge; state in `src/data/bot-state.json`. |
+| `src/order-builder/updown-bot.ts` | **UpDownPredictionBot**: 5m BTC slug resolution, WebSocket orderbook, predictor → first-side buy + second-side hedge; state in `src/data/bot-state.json`. |
 | `src/providers/clobclient.ts` | Polymarket CLOB client singleton (credentials + `PRIVATE_KEY`). |
 | `src/providers/websocketOrderbook.ts` | WebSocket to Polymarket CLOB market channel; best bid/ask by token ID. |
 | `src/utils/pricePredictor.ts` | **AdaptivePricePredictor**: direction, confidence, signal (BUY_UP / BUY_DOWN / HOLD). |

@@ -6,18 +6,18 @@ import { config } from "../config";
 import { WebSocketOrderBook, TokenPrice } from "../providers/websocketOrderbook";
 import { AdaptivePricePredictor, PricePrediction } from "../utils/pricePredictor";
 // Helper functions for market slug and token IDs
-function slugForCurrent15m(market: string): string {
+function slugForCurrent5m(market: string): string {
     const now = new Date();
     const d = new Date(now);
     d.setSeconds(0, 0);
     d.setMilliseconds(0);
     const m = d.getMinutes();
-    const slotMin = Math.floor(m / 15) * 15;
+    const slotMin = Math.floor(m / 5) * 5;
     d.setMinutes(slotMin, 0, 0);
-    // Get Unix timestamp in seconds for the start of this 15-minute slot
+    // Get Unix timestamp in seconds for the start of this 5-minute slot
     const timestamp = Math.floor(d.getTime() / 1000);
-    // Format: {market}-updown-15m-{timestamp}
-    return `${market}-updown-15m-${timestamp}`;
+    // Format: {market}-updown-5m-{timestamp}
+    return `${market}-updown-5m-${timestamp}`;
 }
 
 function parseJsonArray<T>(raw: unknown, ctx: string): T[] {
@@ -63,7 +63,7 @@ type SimpleStateRow = {
 type SimpleStateFile = Record<string, SimpleStateRow>;
 
 type SimpleConfig = {
-    markets: string[]; // e.g. ["btc","eth","sol","xrp"]
+    market: "btc";
     sharesPerSide: number; // shares required per side (e.g., 5)
     tickSize: CreateOrderOptions["tickSize"];
     negRisk: boolean;
@@ -189,11 +189,13 @@ export class UpDownPredictionBot {
 
     static async fromEnv(client: ClobClient): Promise<UpDownPredictionBot> {
         const {
-            markets, sharesPerSide, tickSize, negRisk,
+            sharesPerSide, tickSize, negRisk,
             priceBuffer, fireAndForget, minBalanceUsdc
         } = config.trading;
         const bot = new UpDownPredictionBot(client, {
-            markets, sharesPerSide, tickSize: tickSize as CreateOrderOptions["tickSize"],
+            market: "btc",
+            sharesPerSide,
+            tickSize: tickSize as CreateOrderOptions["tickSize"],
             negRisk, priceBuffer, fireAndForget, minBalanceUsdc,
         });
         await bot.initializationPromise; // Await WebSocket initialization
@@ -226,24 +228,24 @@ export class UpDownPredictionBot {
             return;
         }
 
-        logger.info(`Starting UpDownPredictionBot for markets: ${this.cfg.markets.join(", ")}`);
-        await this.initializeMarkets();
+        logger.info(`Starting UpDownPredictionBot for BTC updown-5m pools`);
+        await this.initializeMarket(this.cfg.market);
 
-        // Set up periodic summary generation - only at quarter-hour boundaries (0m, 15m, 30m, 45m)
-        // Check every minute to catch quarter-hour boundaries precisely
+        // Set up periodic summary generation - only at 5-minute boundaries
+        // Check every minute to catch boundaries precisely
         setInterval(() => {
             const now = new Date();
             const minutes = now.getMinutes();
             const seconds = now.getSeconds();
 
-            // Only generate summaries at quarter-hour boundaries (0m, 15m, 30m, 45m)
+            // Only generate summaries at 5-minute boundaries (..:00, ..:05, ..:10, ...)
             // Check within the first 5 seconds of the minute to avoid duplicates
-            if ((minutes === 0 || minutes === 15 || minutes === 30 || minutes === 45) && seconds < 5) {
+            if (minutes % 5 === 0 && seconds < 5) {
                 this.generateAllPredictionSummaries();
             }
         }, 60 * 1000); // Check every minute
 
-        // Set up periodic market cycle check (every 10 seconds to catch quarter-hour boundaries)
+        // Set up periodic market cycle check (every 10 seconds to catch 5-minute boundaries)
         // This ensures we detect market cycle changes even if there are no price updates
         setInterval(() => {
             this.checkAndHandleMarketCycleChanges();
@@ -263,15 +265,9 @@ export class UpDownPredictionBot {
         logger.info("UpDownPredictionBot stopped");
     }
 
-    private async initializeMarkets(): Promise<void> {
-        for (const market of this.cfg.markets) {
-            await this.initializeMarket(market);
-        }
-    }
-
     private async initializeMarket(market: string): Promise<void> {
         try {
-            const slug = slugForCurrent15m(market);
+            const slug = slugForCurrent5m(market);
             logger.info(`Initializing market ${market} with slug ${slug}`);
             const tokenIds = await fetchTokenIdsForSlug(slug);
             this.tokenIdsByMarket[market] = { slug, ...tokenIds };
@@ -296,7 +292,7 @@ export class UpDownPredictionBot {
             }
         } catch (e) {
             const errorMsg = e instanceof Error ? e.message : String(e);
-            const slug = slugForCurrent15m(market);
+            const slug = slugForCurrent5m(market);
             logger.error(`⚠️  Market ${market} not available yet (${slug}): ${errorMsg}. Will retry on next price update.`);
             // Don't throw - allow the bot to continue and retry later
         }
@@ -317,7 +313,7 @@ export class UpDownPredictionBot {
 
         // Defer heavy processing to prevent blocking WebSocket message loop
         queueMicrotask(async () => {
-            // Get slug for current 15m cycle (with caching)
+            // Get slug for current 5m cycle
             const slug = this.getSlugForMarket(market);
             if (!slug) {
                 // Market not initialized yet - initialize it
@@ -361,7 +357,7 @@ export class UpDownPredictionBot {
             const row = state[k] ?? emptyRow();
             state[k] = row;
 
-            // Check for market cycle change (new 15m period)
+            // Check for market cycle change (new 5m period)
             // Initialize lastSlugByMarket if not set (first time)
             if (!this.lastSlugByMarket[market]) {
                 this.lastSlugByMarket[market] = slug;
@@ -464,7 +460,7 @@ export class UpDownPredictionBot {
     }
 
     private getSlugForMarket(market: string): string {
-        return slugForCurrent15m(market);
+        return slugForCurrent5m(market);
     }
 
     /**
@@ -473,18 +469,14 @@ export class UpDownPredictionBot {
      */
     private async checkAndHandleMarketCycleChanges(): Promise<void> {
         if (this.isStopped) return;
-
-        for (const market of this.cfg.markets) {
-            const currentSlug = this.getSlugForMarket(market);
-            if (!currentSlug) continue;
-
-            const prevSlug = this.lastSlugByMarket[market];
-            if (prevSlug && prevSlug !== currentSlug) {
-                logger.info(`🔄 Market cycle change detected via periodic check for ${market}: ${prevSlug} → ${currentSlug}`);
-
-                // Directly re-initialize to avoid duplicate work
-                await this.reinitializeMarketForNewCycle(market, prevSlug, currentSlug);
-            }
+        const market = this.cfg.market;
+        const currentSlug = this.getSlugForMarket(market);
+        const prevSlug = this.lastSlugByMarket[market];
+        if (prevSlug && prevSlug !== currentSlug) {
+            logger.info(
+                `🔄 Market cycle change detected via periodic check for ${market}: ${prevSlug} → ${currentSlug}`
+            );
+            await this.reinitializeMarketForNewCycle(market, prevSlug, currentSlug);
         }
     }
 
@@ -978,8 +970,8 @@ export class UpDownPredictionBot {
         const now = new Date();
         const minutes = now.getMinutes();
 
-        // Only generate summaries at quarter-hour boundaries (0m, 15m, 30m, 45m)
-        if (minutes !== 0 && minutes !== 15 && minutes !== 30 && minutes !== 45) {
+        // Only generate summaries at 5-minute boundaries
+        if (minutes % 5 !== 0) {
             return; // Not at a quarter-hour boundary, skip
         }
 

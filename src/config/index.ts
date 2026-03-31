@@ -79,7 +79,6 @@ export const config = {
 
     /** Up/Down prediction trading settings */
     trading: {
-        markets: envCsvLower("TRADING_MARKETS", envCsvLower("COPYTRADE_MARKETS", envString("GABAGOOL_MARKETS", "btc")!).join(",")!),
         sharesPerSide: envNumber("TRADING_SHARES", envNumber("COPYTRADE_SHARES", envNumber("GABAGOOL_SHARES", 5))),
         tickSize: (envString("TRADING_TICK_SIZE", envString("COPYTRADE_TICK_SIZE", envString("GABAGOOL_TICK_SIZE", "0.01")!)!) ??
             "0.01") as "0.01" | "0.001" | "0.0001" | string,

@@ -1,0 +1,24 @@
+
+
+
+
+
+===== LOG START 2026-03-31T08:44:10.693Z pid=26352 =====
+
+
+
+
+2026-03-31T08:44:10.694Z  INFO  Starting the bot...
+2026-03-31T08:44:10.731Z  INFO  wallet address 0xe875eDA8b683840AC8df884c69B3f32eF62d52a0
+[CLOB Client] request error {"status":400,"statusText":"Bad Request","data":{"error":"Could not create api key"},"config":{"transitional":{"silentJSONParsing":true,"forcedJSONParsing":true,"clarifyTimeoutError":false},"transformRequest":[null],"transformResponse":[null],"timeout":0,"xsrfCookieName":"XSRF-TOKEN","xsrfHeaderName":"X-XSRF-TOKEN","maxContentLength":-1,"maxBodyLength":-1,"env":{},"headers":{"Accept":"*/*","Content-Type":"application/json","POLY_ADDRESS":"0xe875eDA8b683840AC8df884c69B3f32eF62d52a0","POLY_SIGNATURE":"0x7f501e03267554e2d925bc7989c9555020e531e0377a37b551831a57e29157b4496739799aa0ff2c4b80490365d616c9c2db6580578c40501851511f2e385d0c1c","POLY_TIMESTAMP":"1774946650","POLY_NONCE":"0","User-Agent":"@polymarket/clob-client","Connection":"keep-alive"},"method":"post","url":"https://clob.polymarket.com/auth/api-key","params":{}}}
+2026-03-31T08:44:12.904Z  INFO  Credential created successfully
+2026-03-31T08:44:12.904Z  INFO  Credentials ready
+2026-03-31T08:44:17.502Z  INFO  Approving USDC allowances to Polymarket contracts...
+2026-03-31T08:44:18.234Z  INFO  Approving USDC allowances for address: 0xe875eDA8b683840AC8df884c69B3f32eF62d52a0, chainId: 137
+2026-03-31T08:44:18.234Z  INFO  RPC: https://polygon-mainnet.infura.io/v3/24dd5bdecf3642f7811b8383120e16e7
+2026-03-31T08:44:18.234Z  INFO  USDC Contract: 0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174
+2026-03-31T08:44:18.234Z  INFO  ConditionalTokens Contract: 0x4D97DCd97eC945f40cF65F87097ACe5EA0476045
+2026-03-31T08:44:18.234Z  INFO  Exchange Contract: 0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E
+2026-03-31T08:44:19.675Z  INFO  ✅ USDC already approved for ConditionalTokens contract (MaxUint256)
+2026-03-31T08:44:20.387Z  INFO  Current Exchange allowance: 115792089237316195423570985008687907853269984665640564039457584007913078582935, setting to MaxUint256...
+2026-03-31T08:44:25.498Z  INFO  Transaction hash: 0x88ff099789613f2cad2aa265325a68e70f10004942bd59564688b757813739ce

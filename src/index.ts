@@ -18,23 +18,23 @@ setupConsoleFileLogging({
     filePrefix: config.logging.logFilePrefix,
 });
 
-function msUntilNext15mBoundary(now: Date = new Date()): number {
+function msUntilNext5mBoundary(now: Date = new Date()): number {
     const d = new Date(now);
     d.setSeconds(0, 0);
     const m = d.getMinutes();
-    const nextMin = (Math.floor(m / 15) + 1) * 15;
+    const nextMin = (Math.floor(m / 5) + 1) * 5;
     d.setMinutes(nextMin, 0, 0);
     return Math.max(0, d.getTime() - now.getTime());
 }
 
 async function waitForNextMarketStart(): Promise<void> {
-    const ms = msUntilNext15mBoundary();
+    const ms = msUntilNext5mBoundary();
     if (ms <= 0) return;
     logger.info(
-        `Waiting for next 15m market start: ${Math.ceil(ms / 1000)}s (start at next boundary)`
+        `Waiting for next 5m market start: ${Math.ceil(ms / 1000)}s (start at next boundary)`
     );
     await new Promise((resolve) => setTimeout(resolve, ms));
-    logger.info("Next 15m market started — starting bot now");
+    logger.info("Next 5m market started — starting bot now");
 }
 
 async function waitMs(ms: number, label: string): Promise<void> {
@@ -82,7 +82,7 @@ async function main() {
         if (config.bot.waitForNextMarketStart) {
             await waitForNextMarketStart();
         } else {
-            logger.info("Skipping wait for next 15m market start (resume immediately from state)");
+            logger.info("Skipping wait for next 5m market start (resume immediately from state)");
         }
         // Delay trading start to allow previous market to become redeemable (~200s) and be redeemed by worker.
         const bot = await UpDownPredictionBot.fromEnv(clobClient);
