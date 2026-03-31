@@ -3,7 +3,6 @@ import * as fs from "fs";
 import * as path from "path";
 import { logger } from "../utils/logger";
 import { config } from "../config";
-import { addHoldings } from "../utils/holdings";
 import { WebSocketOrderBook, TokenPrice } from "../providers/websocketOrderbook";
 import { AdaptivePricePredictor, PricePrediction } from "../utils/pricePredictor";
 // Helper functions for market slug and token IDs
@@ -50,11 +49,6 @@ async function fetchTokenIdsForSlug(
     return { upTokenId: tokenIds[upIdx], downTokenId: tokenIds[downIdx], conditionId, upIdx, downIdx };
 }
 
-async function getClobClient() {
-    const { getClobClient } = await import("../providers/clobclient");
-    return await getClobClient();
-}
-
 type SimpleStateRow = {
     previousUpPrice: number | null; // Previous cycle's UP token price
     lastUpdatedIso: string;
@@ -79,7 +73,7 @@ type SimpleConfig = {
     minBalanceUsdc: number; // Minimum balance before stopping
 };
 
-const STATE_FILE = "src/data/copytrade-state.json";
+const STATE_FILE = "src/data/bot-state.json";
 
 function statePath(): string {
     return path.resolve(process.cwd(), STATE_FILE);
@@ -140,7 +134,7 @@ function saveState(state: SimpleStateFile): void {
     }, 500); // Debounce saves by 500ms
 }
 
-export class CopytradeArbBot {
+export class UpDownPredictionBot {
     private lastSlugByMarket: Record<string, string> = {};
     private tokenIdsByMarket: Record<
         string,
@@ -150,11 +144,9 @@ export class CopytradeArbBot {
     private isStopped: boolean = false;
     private wsOrderBook: WebSocketOrderBook | null = null;
     private useWebSocket: boolean = true; // Toggle to use WebSocket or API
-    private slugCache: Map<string, { slug: string; timestamp: number }> = new Map(); // Cache slug calculations
-    private lastProcessedPrice: Map<string, number> = new Map(); // Track last processed price per market
-    private pricePredictors: Map<string, AdaptivePricePredictor> = new Map(); // Price predictors per market
-    private lastPredictions: Map<string, { prediction: PricePrediction; actualPrice: number; timestamp: number }> = new Map(); // Track predictions for accuracy
-    private marketStartTimeBySlug: Map<string, number> = new Map(); // Track when each market slug started
+    private lastProcessedPrice: Map<string, number> = new Map();
+    private pricePredictors: Map<string, AdaptivePricePredictor> = new Map();
+    private lastPredictions: Map<string, { prediction: PricePrediction; actualPrice: number; timestamp: number }> = new Map();
 
     // Limit order second side strategy tracking
     private tokenCountsByMarket: Map<string, { upTokenCount: number; downTokenCount: number }> = new Map(); // Track token counts per market
@@ -190,17 +182,17 @@ export class CopytradeArbBot {
 
     constructor(private client: ClobClient, private cfg: SimpleConfig) {
         // Initialize MAX_BUY_COUNTS_PER_SIDE from config
-        this.MAX_BUY_COUNTS_PER_SIDE = config.copytrade.maxBuyCountsPerSide;
+        this.MAX_BUY_COUNTS_PER_SIDE = config.trading.maxBuyCountsPerSide;
         // Initialize WebSocket orderbook (store promise for later awaiting)
         this.initializationPromise = this.initializeWebSocket();
     }
 
-    static async fromEnv(client: ClobClient): Promise<CopytradeArbBot> {
+    static async fromEnv(client: ClobClient): Promise<UpDownPredictionBot> {
         const {
             markets, sharesPerSide, tickSize, negRisk,
             priceBuffer, fireAndForget, minBalanceUsdc
-        } = config.copytrade;
-        const bot = new CopytradeArbBot(client, {
+        } = config.trading;
+        const bot = new UpDownPredictionBot(client, {
             markets, sharesPerSide, tickSize: tickSize as CreateOrderOptions["tickSize"],
             negRisk, priceBuffer, fireAndForget, minBalanceUsdc,
         });
@@ -234,7 +226,7 @@ export class CopytradeArbBot {
             return;
         }
 
-        logger.info(`Starting CopytradeArbBot for markets: ${this.cfg.markets.join(", ")}`);
+        logger.info(`Starting UpDownPredictionBot for markets: ${this.cfg.markets.join(", ")}`);
         await this.initializeMarkets();
 
         // Set up periodic summary generation - only at quarter-hour boundaries (0m, 15m, 30m, 45m)
@@ -268,7 +260,7 @@ export class CopytradeArbBot {
         if (this.wsOrderBook) {
             this.wsOrderBook.disconnect();
         }
-        logger.info("CopytradeArbBot stopped");
+        logger.info("UpDownPredictionBot stopped");
     }
 
     private async initializeMarkets(): Promise<void> {
@@ -318,7 +310,7 @@ export class CopytradeArbBot {
         market: string,
         tokenIds: { slug: string; upTokenId: string; downTokenId: string; conditionId: string; upIdx: number; downIdx: number },
         price: TokenPrice,
-        leg: "YES" | "NO"
+        _leg: "YES" | "NO"
     ): Promise<void> {
         if (this.isStopped) return;
         if (!price.bestAsk || !Number.isFinite(price.bestAsk)) return; // Use bestAsk
@@ -378,71 +370,19 @@ export class CopytradeArbBot {
             const prevSlug = this.lastSlugByMarket[market];
             if (prevSlug && prevSlug !== slug) {
                 logger.info(`🔄 New market cycle detected for ${market}: ${prevSlug} → ${slug}`);
+                await this.reinitializeMarketForNewCycle(market, prevSlug, slug);
 
-                // Generate prediction score summary for previous market
-                this.generatePredictionScoreSummary(prevSlug, market);
+                // Refresh tokenIds after re-init
+                const refreshed = this.tokenIdsByMarket[market];
+                if (!refreshed || refreshed.slug !== slug) return;
+                currentTokenIds = refreshed;
 
-                // Reset token counts and paused state for previous market
-                const prevScoreKey = `${market}-${prevSlug}`;
-                this.tokenCountsByMarket.delete(prevScoreKey);
-                this.pausedMarkets.delete(prevScoreKey);
-
-                // Re-initialize market with new slug to get new token IDs
-                logger.info(`🔄 Re-initializing market ${market} with new slug ${slug}`);
-                try {
-                    const newTokenIds = await fetchTokenIdsForSlug(slug);
-                    this.tokenIdsByMarket[market] = { slug, ...newTokenIds };
-
-                    // Update WebSocket subscriptions for new tokens
-                    if (this.wsOrderBook) {
-                        // Unsubscribe from old tokens (optional, but clean)
-                        // Subscribe to new tokens
-                        this.wsOrderBook.subscribeToTokenIds([newTokenIds.upTokenId, newTokenIds.downTokenId]);
-
-                        // Set token labels for logging
-                        this.wsOrderBook.setTokenLabel(newTokenIds.upTokenId, "Up");
-                        this.wsOrderBook.setTokenLabel(newTokenIds.downTokenId, "Down");
-
-                        // Update callbacks with new token IDs
-                        this.wsOrderBook.onPriceUpdate(newTokenIds.upTokenId, (tokenId, price) => {
-                            void this.handlePriceUpdate(market, { slug, ...newTokenIds }, price, "YES");
-                        });
-
-                        this.wsOrderBook.onPriceUpdate(newTokenIds.downTokenId, (tokenId, price) => {
-                            void this.handlePriceUpdate(market, { slug, ...newTokenIds }, price, "NO");
-                        });
-                    }
-
-                    // Update tokenIds for this function call
-                    Object.assign(tokenIds, { slug, ...newTokenIds });
-                    currentTokenIds = { slug, ...newTokenIds };
-
-                    logger.info(`✅ Market ${market} re-initialized with new token IDs`);
-                } catch (e) {
-                    const errorMsg = e instanceof Error ? e.message : String(e);
-                    logger.error(`⚠️  Failed to re-initialize market ${market} with new slug ${slug}: ${errorMsg}. Will retry on next price update.`);
-                    // Don't update lastSlugByMarket if initialization failed - will retry
-                    return; // Exit early, will retry on next price update
-                }
-
-                this.lastSlugByMarket[market] = slug;
-                // Clear slug cache for this market
-                this.slugCache.delete(market);
-                // Reset price predictor for new market cycle
-                const predictor = this.pricePredictors.get(market);
-                if (predictor) {
-                    predictor.reset();
-                }
-
-                // Re-fetch prices with new token IDs after re-initialization
                 const newUpPrice = this.wsOrderBook?.getPrice(currentTokenIds.upTokenId);
                 const newDownPrice = this.wsOrderBook?.getPrice(currentTokenIds.downTokenId);
                 if (!newUpPrice?.bestAsk || !newDownPrice?.bestAsk ||
                     !Number.isFinite(newUpPrice.bestAsk) || !Number.isFinite(newDownPrice.bestAsk)) {
-                    // New tokens not ready yet, wait for next price update
                     return;
                 }
-                // Update prices for rest of function
                 upAsk = newUpPrice.bestAsk;
                 downAsk = newDownPrice.bestAsk;
             }
@@ -502,7 +442,7 @@ export class CopytradeArbBot {
             logger.info(`🔮 PREDICT [POLE]: ${prediction.predictedPrice.toFixed(4)} (current: ${upAsk.toFixed(4)}) | Direction: ${prediction.direction.toUpperCase()} | Confidence: ${(prediction.confidence * 100).toFixed(1)}% | Signal: ${prediction.signal} | Momentum: ${prediction.features.momentum.toFixed(3)} | Vol: ${prediction.features.volatility.toFixed(3)} | Trend: ${prediction.features.trend.toFixed(3)}`);
 
             // Execute prediction-based trading strategy
-            this.executePredictionTrade(market, slug, prediction, upAsk, downAsk, currentTokenIds, state, k, row);
+            this.executePredictionTrade(market, slug, prediction, upAsk, downAsk, currentTokenIds);
 
             // Log accuracy stats periodically (every 25 predictions, and at milestones)
             const stats = predictor.getAccuracyStats();
@@ -523,19 +463,8 @@ export class CopytradeArbBot {
         });
     }
 
-    /**
-     * Get slug for current market (always fresh to detect cycle changes)
-     */
-    private getSlugForMarket(market: string): string | null {
-        // Always calculate fresh slug to detect 15-minute cycle changes immediately
-        // Don't cache to ensure we always detect new cycles at 0m, 15m, 30m, 45m
-        const slug = slugForCurrent15m(market);
-
-        // Update cache for logging/debugging purposes only
-        if (slug) {
-            this.slugCache.set(market, { slug, timestamp: Date.now() });
-        }
-        return slug;
+    private getSlugForMarket(market: string): string {
+        return slugForCurrent15m(market);
     }
 
     /**
@@ -598,18 +527,11 @@ export class CopytradeArbBot {
 
             this.lastSlugByMarket[market] = newSlug;
 
-            // Clear slug cache for this market
-            this.slugCache.delete(market);
-
-            // Reset price predictor for new market cycle
             const predictor = this.pricePredictors.get(market);
             if (predictor) {
                 predictor.reset();
             }
 
-            // Track market start time
-            const scoreKey = `${market}-${newSlug}`;
-            this.marketStartTimeBySlug.set(scoreKey, Date.now());
             logger.info(`✅ Market ${market} re-initialized with new token IDs for cycle ${newSlug}`);
         } catch (e) {
             const errorMsg = e instanceof Error ? e.message : String(e);
@@ -617,59 +539,24 @@ export class CopytradeArbBot {
         }
     }
 
-    /**
-     * Buy shares with retry logic (optimized for immediate execution)
-     */
-    private async buySharesWithRetry(
-        leg: "YES" | "NO",
-        tokenID: string,
-        askPrice: number,
-        size: number,
-        state: SimpleStateFile,
-        key: string,
-        row: SimpleStateRow,
-        market: string,
-        slug: string,
-        conditionId: string,
-        upIdx: number,
-        downIdx: number
-    ): Promise<boolean> {
-        return await this.buyShares(leg, tokenID, askPrice, size, state, key, row, market, slug, conditionId, upIdx, downIdx);
-    }
-
-    /**
-     * Buy shares (limit order at best ask)
-     * Places order immediately (within 10ms) without async delay
-     */
     private async buyShares(
         leg: "YES" | "NO",
         tokenID: string,
         askPrice: number,
         size: number,
-        state: SimpleStateFile,
-        key: string,
-        row: SimpleStateRow,
-        market: string,
-        slug: string,
-        conditionId: string,
-        upIdx: number,
-        downIdx: number
     ): Promise<boolean> {
-        const limitPrice = askPrice+0.01; // Use askPrice directly for limit order
-
-        const estimatedShares = size;
+        const limitPrice = askPrice + 0.01;
 
         const limitOrder: UserOrder = {
             tokenID,
             side: Side.BUY,
             price: limitPrice,
-            size: size,
+            size,
         };
 
         const orderAmount = limitPrice * size;
 
-        // Log buy
-        logger.info(`BUY: ${leg} ~${estimatedShares} shares @ limit ${limitPrice.toFixed(4)} (${orderAmount.toFixed(2)} USDC)`);
+        logger.info(`BUY: ${leg} ~${size} shares @ limit ${limitPrice.toFixed(4)} (${orderAmount.toFixed(2)} USDC)`);
 
         // Place order IMMEDIATELY (await to ensure it's placed within 10ms)
         try {
@@ -705,9 +592,6 @@ export class CopytradeArbBot {
         upAsk: number,
         downAsk: number,
         tokenIds: { upTokenId: string; downTokenId: string; conditionId: string; upIdx: number; downIdx: number },
-        state: SimpleStateFile,
-        k: string,
-        row: SimpleStateRow
     ): void {
         // Initialize prediction score for this market/slug if not exists
         const scoreKey = `${market}-${slug}`;
@@ -725,10 +609,6 @@ export class CopytradeArbBot {
                 correctPredictions: 0,
                 trades: [],
             });
-            // Track market start time if not already tracked
-            if (!this.marketStartTimeBySlug.has(scoreKey)) {
-                this.marketStartTimeBySlug.set(scoreKey, Date.now());
-            }
         }
 
         const score = this.predictionScores.get(scoreKey)!;
@@ -808,20 +688,11 @@ export class CopytradeArbBot {
         const buyCost = buyPrice * this.cfg.sharesPerSide;
         logger.info(`🎯 FIRST-SIDE Trade: ${buyToken} @ ${buyPrice.toFixed(4)} (${buyCost.toFixed(2)} USDC) | UP ${tokenCounts.upTokenCount}/${this.MAX_BUY_COUNTS_PER_SIDE}, DOWN ${tokenCounts.downTokenCount}/${this.MAX_BUY_COUNTS_PER_SIDE} | Limit: ${this.MAX_BUY_COUNTS_PER_SIDE} per side`);
 
-        // Place first-side order (fire-and-forget, don't wait for response)
-        this.buySharesWithRetry(
+        this.buyShares(
             buyToken === "UP" ? "YES" : "NO",
             tokenId,
             buyPrice,
             this.cfg.sharesPerSide,
-            state,
-            k,
-            row,
-            market,
-            slug,
-            tokenIds.conditionId,
-            tokenIds.upIdx,
-            tokenIds.downIdx
         );
 
         // Place second-side limit order IMMEDIATELY (within 50ms) without waiting for first order response
@@ -999,18 +870,9 @@ export class CopytradeArbBot {
 
                         logger.info(`✅ Limit order filled: ${leg} @ ${limitPrice.toFixed(4)} | UP ${tokenCounts.upTokenCount}/${this.MAX_BUY_COUNTS_PER_SIDE}, DOWN ${tokenCounts.downTokenCount}/${this.MAX_BUY_COUNTS_PER_SIDE}`);
 
-                        // Check if we've reached the limit after this fill
                         if (tokenCounts.upTokenCount >= this.MAX_BUY_COUNTS_PER_SIDE && tokenCounts.downTokenCount >= this.MAX_BUY_COUNTS_PER_SIDE) {
                             this.pausedMarkets.add(scoreKey);
                             logger.info(`⏸️  Market ${scoreKey} PAUSED after limit order fill: UP: ${tokenCounts.upTokenCount}/${this.MAX_BUY_COUNTS_PER_SIDE}, DOWN: ${tokenCounts.downTokenCount}/${this.MAX_BUY_COUNTS_PER_SIDE}`);
-                        }
-
-                        // Also check if individual side reached limit (pause that side)
-                        if (tokenCounts.upTokenCount >= this.MAX_BUY_COUNTS_PER_SIDE || tokenCounts.downTokenCount >= this.MAX_BUY_COUNTS_PER_SIDE) {
-                            // Market should be paused if both sides reach limit
-                            if (tokenCounts.upTokenCount >= this.MAX_BUY_COUNTS_PER_SIDE && tokenCounts.downTokenCount >= this.MAX_BUY_COUNTS_PER_SIDE) {
-                                this.pausedMarkets.add(scoreKey);
-                            }
                         }
 
                         return; // Order filled, stop tracking
@@ -1132,77 +994,4 @@ export class CopytradeArbBot {
         }
     }
 
-    /**
-     * Track order asynchronously and log holdings when filled
-     */
-    private async trackOrderAsync(
-        orderID: string,
-        leg: "YES" | "NO",
-        tokenID: string,
-        conditionId: string,
-        estimatedShares: number,
-        askPrice: number,
-        state: SimpleStateFile,
-        key: string,
-        market: string,
-        slug: string,
-        upIdx: number,
-        downIdx: number
-    ): Promise<void> {
-        let lastLoggedSize = 0;
-        const maxAttempts = 10;
-        const delayMs = 100;
-
-        for (let attempt = 0; attempt < maxAttempts; attempt++) {
-            try {
-                const order = await this.client.getOrder(orderID);
-                if (!order) {
-                    if (attempt < maxAttempts - 1) {
-                        await new Promise(resolve => setTimeout(resolve, delayMs));
-                        continue;
-                    }
-                    logger.error(`Order ${orderID} not found after ${maxAttempts} attempts`);
-                    return;
-                }
-
-                const status = order.status;
-                const sizeMatched = typeof order.size_matched === "number" ? order.size_matched : (typeof order.size_matched === "string" ? parseFloat(order.size_matched) : 0);
-
-                // Check if order is filled (fully or partially)
-                if (status === "MATCHED" || status === "FILLED" || status === "PARTIALLY_FILLED" || sizeMatched > 0) {
-                    const newlyFilled = sizeMatched - lastLoggedSize;
-                    if (newlyFilled > 0) {
-                        // Log holdings for redemption - use conditionId as the key, not market name
-                        addHoldings(conditionId, tokenID, newlyFilled);
-                        logger.info(`✅ ${leg} order ${orderID} filled: ${newlyFilled} shares (total matched: ${sizeMatched}/${estimatedShares})`);
-                        lastLoggedSize = sizeMatched;
-                    }
-
-                    // If fully filled, we're done
-                    if (status === "FILLED" || status === "MATCHED" || sizeMatched >= estimatedShares) {
-                        logger.info(`✅ ${leg} order ${orderID} fully filled: ${sizeMatched} shares`);
-                        return;
-                    }
-                }
-
-                // If order is cancelled or failed, stop tracking
-                if (status === "CANCELLED" || status === "FAILED") {
-                    logger.error(`Order ${orderID} ${status.toLowerCase()}`);
-                    return;
-                }
-
-                // Wait before next check
-                if (attempt < maxAttempts - 1) {
-                    await new Promise(resolve => setTimeout(resolve, delayMs));
-                }
-            } catch (e) {
-                logger.error(`Error tracking order ${orderID}: ${e instanceof Error ? e.message : String(e)}`);
-                if (attempt < maxAttempts - 1) {
-                    await new Promise(resolve => setTimeout(resolve, delayMs));
-                }
-            }
-        }
-
-        logger.error(`Order ${orderID} tracking completed after ${maxAttempts} attempts (may still be pending)`);
-    }
 }

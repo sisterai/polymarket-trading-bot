@@ -62,42 +62,6 @@ export function addHoldings(marketId: string, tokenId: string, amount: number): 
 }
 
 /**
- * Get holdings for a specific token
- */
-export function getHoldings(marketId: string, tokenId: string): number {
-    const holdings = loadHoldings();
-    return holdings[marketId]?.[tokenId] || 0;
-}
-
-/**
- * Remove tokens from holdings after a SELL order
- */
-export function removeHoldings(marketId: string, tokenId: string, amount: number): void {
-    const holdings = loadHoldings();
-    
-    if (!holdings[marketId] || !holdings[marketId][tokenId]) {
-        logger.error(`No holdings found for ${marketId} -> ${tokenId}`);
-        return;
-    }
-    
-    const currentAmount = holdings[marketId][tokenId];
-    const newAmount = Math.max(0, currentAmount - amount);
-    
-    if (newAmount === 0) {
-        delete holdings[marketId][tokenId];
-        // Clean up empty market entries
-        if (Object.keys(holdings[marketId]).length === 0) {
-            delete holdings[marketId];
-        }
-    } else {
-        holdings[marketId][tokenId] = newAmount;
-    }
-    
-    saveHoldings(holdings);
-    logger.info(`Removed ${amount} tokens from holdings: ${marketId} -> ${tokenId} (remaining: ${newAmount})`);
-}
-
-/**
  * Get all holdings for a market
  */
 export function getMarketHoldings(marketId: string): { [tokenId: string]: number } {
@@ -124,13 +88,5 @@ export function clearMarketHoldings(marketId: string): void {
     } else {
         logger.error(`No holdings found for market: ${marketId}`);
     }
-}
-
-/**
- * Clear all holdings (use with caution)
- */
-export function clearHoldings(): void {
-    saveHoldings({});
-    logger.info("All holdings cleared");
 }
 

@@ -268,7 +268,7 @@ export async function redeemPositions(options: RedeemOptions): Promise<any> {
     const contractConfig = getContractConfig(chainId);
     
     // Get RPC URL and create provider
-    const { provider, rpcUrl } = await getWorkingProvider(chainId);
+    const { provider } = await getWorkingProvider(chainId);
     const wallet = new Wallet(privateKey, provider);
     
     const address = await wallet.getAddress();
@@ -414,29 +414,6 @@ async function retryWithBackoff<T>(
 }
 
 /**
- * Redeem positions for a specific condition with manually specified index sets
- * 
- * NOTE: For automatic redemption of winning outcomes only, use redeemMarket() instead.
- * This function allows you to manually specify which indexSets to redeem.
- * 
- * @param conditionId - The condition ID (market ID) to redeem from
- * @param indexSets - Array of indexSets to redeem (e.g., [1, 2] for both outcomes)
- * @param chainId - Optional chain ID (defaults to Chain.POLYGON)
- * @returns Transaction receipt
- */
-export async function redeemPositionsDefault(
-    conditionId: string,
-    chainId?: Chain,
-    indexSets: number[] = [1, 2] // Default to both outcomes for Polymarket binary markets
-): Promise<any> {
-    return redeemPositions({
-        conditionId,
-        indexSets,
-        chainId,
-    });
-}
-
-/**
  * Redeem winning positions for a specific market (conditionId)
  * This function automatically determines which outcomes won and only redeems those
  * that the user actually holds tokens for.
@@ -459,7 +436,7 @@ export async function redeemMarket(
     const contractConfig = getContractConfig(chainIdValue);
     
     // Get RPC URL and create provider
-    const { provider, rpcUrl } = await getWorkingProvider(chainIdValue);
+    const { provider } = await getWorkingProvider(chainIdValue);
     const wallet = new Wallet(privateKey, provider);
     const walletAddress = await wallet.getAddress();
     
@@ -549,7 +526,7 @@ export async function checkConditionResolution(
     const contractConfig = getContractConfig(chainIdValue);
     
     // Get RPC URL and create provider
-    const { provider, rpcUrl } = await getWorkingProvider(chainIdValue);
+    const { provider } = await getWorkingProvider(chainIdValue);
     const wallet = new Wallet(privateKey, provider);
     
     // Convert conditionId to bytes32 format
@@ -639,8 +616,7 @@ export async function getUserTokenBalances(
     const chainIdValue = chainId || ((config.chainId || Chain.POLYGON) as Chain);
     const contractConfig = getContractConfig(chainIdValue);
     
-    // Get RPC URL and create provider
-    const { provider, rpcUrl } = await getWorkingProvider(chainIdValue);
+    const { provider } = await getWorkingProvider(chainIdValue);
     const wallet = new Wallet(privateKey, provider);
     
     // Convert conditionId to bytes32 format
@@ -971,7 +947,7 @@ export async function getMarketsWithUserPositions(
     const chainIdValue = options?.chainId || ((config.chainId || Chain.POLYGON) as Chain);
     
     // Get RPC URL and create provider
-    const { provider, rpcUrl } = await getWorkingProvider(chainIdValue);
+    const { provider } = await getWorkingProvider(chainIdValue);
     const wallet = new Wallet(privateKey, provider);
     const walletAddress = options?.walletAddress || await wallet.getAddress();
     
@@ -1149,8 +1125,7 @@ export async function redeemAllWinningMarketsFromAPI(options?: {
     const chainIdValue = ((config.chainId || Chain.POLYGON) as Chain);
     const contractConfig = getContractConfig(chainIdValue);
     
-    // Get RPC URL and create provider
-    const { provider, rpcUrl } = await getWorkingProvider(chainIdValue);
+    const { provider } = await getWorkingProvider(chainIdValue);
     const wallet = new Wallet(privateKey, provider);
     const walletAddress = await wallet.getAddress();
     

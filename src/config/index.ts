@@ -67,7 +67,7 @@ export const config = {
     /** Bot runner settings */
     bot: {
         minUsdcBalance: envNumber("BOT_MIN_USDC_BALANCE", 1),
-        waitForNextMarketStart: envBool("COPYTRADE_WAIT_FOR_NEXT_MARKET_START", false),
+        waitForNextMarketStart: envBool("TRADING_WAIT_FOR_NEXT_MARKET_START", envBool("COPYTRADE_WAIT_FOR_NEXT_MARKET_START", false)),
     },
 
     /** Console file logging */
@@ -77,17 +77,17 @@ export const config = {
         logFilePrefix: envString("LOG_FILE_PREFIX", "bot")!,
     },
 
-    /** Copytrade bot settings */
-    copytrade: {
-        markets: envCsvLower("COPYTRADE_MARKETS", envString("GABAGOOL_MARKETS", "btc")!),
-        sharesPerSide: envNumber("COPYTRADE_SHARES", envNumber("GABAGOOL_SHARES", 5)),
-        tickSize: (envString("COPYTRADE_TICK_SIZE", envString("GABAGOOL_TICK_SIZE", "0.01")!) ??
+    /** Up/Down prediction trading settings */
+    trading: {
+        markets: envCsvLower("TRADING_MARKETS", envCsvLower("COPYTRADE_MARKETS", envString("GABAGOOL_MARKETS", "btc")!).join(",")!),
+        sharesPerSide: envNumber("TRADING_SHARES", envNumber("COPYTRADE_SHARES", envNumber("GABAGOOL_SHARES", 5))),
+        tickSize: (envString("TRADING_TICK_SIZE", envString("COPYTRADE_TICK_SIZE", envString("GABAGOOL_TICK_SIZE", "0.01")!)!) ??
             "0.01") as "0.01" | "0.001" | "0.0001" | string,
-        negRisk: envBool("COPYTRADE_NEG_RISK", envBool("GABAGOOL_NEG_RISK", false)),
-        priceBuffer: envNumber("COPYTRADE_PRICE_BUFFER", 0), // Price buffer in cents for order execution (faster fills)
-        fireAndForget: envBool("COPYTRADE_FIRE_AND_FORGET", true), // Don't wait for order confirmation (faster)
-        minBalanceUsdc: envNumber("COPYTRADE_MIN_BALANCE_USDC", 1), // Minimum balance before stopping
-        maxBuyCountsPerSide: envNumber("COPYTRADE_MAX_BUY_COUNTS_PER_SIDE", 0), // Maximum buy counts per side (UP/DOWN) per market before pausing
+        negRisk: envBool("TRADING_NEG_RISK", envBool("COPYTRADE_NEG_RISK", envBool("GABAGOOL_NEG_RISK", false))),
+        priceBuffer: envNumber("TRADING_PRICE_BUFFER", envNumber("COPYTRADE_PRICE_BUFFER", 0)),
+        fireAndForget: envBool("TRADING_FIRE_AND_FORGET", envBool("COPYTRADE_FIRE_AND_FORGET", true)),
+        minBalanceUsdc: envNumber("TRADING_MIN_BALANCE_USDC", envNumber("COPYTRADE_MIN_BALANCE_USDC", 1)),
+        maxBuyCountsPerSide: envNumber("TRADING_MAX_BUY_COUNTS_PER_SIDE", envNumber("COPYTRADE_MAX_BUY_COUNTS_PER_SIDE", 0)),
     },
 
     /** Redeem script args via env */

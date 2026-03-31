@@ -4,16 +4,6 @@ import { config } from "../config";
 const timestamp = () => chalk.gray(new Date().toISOString());
 
 export const logger = {
-  title: (msg: string) =>
-    console.log(
-      `${timestamp()} ${chalk.bgBlue.white.bold(" TITLE ")} ${chalk.blueBright.bold(msg)}`
-    ),
-
-  success: (msg: string) =>
-    console.log(
-      `${timestamp()} ${chalk.bgGreen.black.bold(" SUCCESS ")} ${chalk.greenBright(msg)}`
-    ),
-
   warning: (msg: string) =>
     console.log(
       `${timestamp()} ${chalk.bgYellow.black.bold(" WARNING ")} ${chalk.yellow(msg)}`

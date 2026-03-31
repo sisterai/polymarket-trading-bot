@@ -11,7 +11,7 @@ export function credentialPath(): string {
     return CREDENTIAL_PATH;
 }
 
-export function hasCredentialFile(): boolean {
+function hasCredentialFile(): boolean {
     return existsSync(CREDENTIAL_PATH);
 }
 
@@ -45,7 +45,7 @@ export async function createCredential(): Promise<ApiKeyCreds | null> {
     }
 }
 
-export async function saveCredential(credential: ApiKeyCreds): Promise<void> {
+async function saveCredential(credential: ApiKeyCreds): Promise<void> {
     const dir = dirname(CREDENTIAL_PATH);
     mkdirSync(dir, { recursive: true });
     writeFileSync(CREDENTIAL_PATH, JSON.stringify(credential, null, 2));

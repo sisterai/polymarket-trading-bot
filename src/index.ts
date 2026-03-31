@@ -4,7 +4,7 @@ import { getClobClient } from "./providers/clobclient";
 import { waitForMinimumUsdcBalance } from "./utils/balance";
 import { config } from "./config";
 
-import { CopytradeArbBot } from "./order-builder/copytrade";
+import { UpDownPredictionBot } from "./order-builder/updown-bot";
 import { setupConsoleFileLogging } from "./utils/console-file";
 import { logger } from "./utils/logger";
 
@@ -85,20 +85,19 @@ async function main() {
             logger.info("Skipping wait for next 15m market start (resume immediately from state)");
         }
         // Delay trading start to allow previous market to become redeemable (~200s) and be redeemed by worker.
-        const copytrade = await CopytradeArbBot.fromEnv(clobClient);
+        const bot = await UpDownPredictionBot.fromEnv(clobClient);
         
-        // Handle graceful shutdown - generate summaries before exit
         const shutdown = async (signal: string) => {
             logger.info(`\n🛑 Received ${signal}, generating final summaries...`);
-            copytrade.stop(); // This will generate all summaries
-            await new Promise(resolve => setTimeout(resolve, 1000)); // Give time for summaries to log
+            bot.stop();
+            await new Promise(resolve => setTimeout(resolve, 1000));
             process.exit(0);
         };
         
         process.once("SIGINT", () => void shutdown("SIGINT"));
         process.once("SIGTERM", () => void shutdown("SIGTERM"));
         
-        await copytrade.start();
+        await bot.start();
     } else {
         logger.error("Failed to initialize CLOB client - cannot continue");
         return;
