@@ -140,6 +140,8 @@ export interface RegimeDetectionResult {
   scoreMargin: number;
   previousRegime: Regime | null;
   selectionMethod: "override" | "competition" | "fallback" | "hysteresis_hold";
+  /** Rolling directional persistence in [0,1] (event-time sign history). */
+  persistenceScore?: number;
 
   // Diagnostics: explicit reasons so logs are calibratable.
   overrideReason?: string;
@@ -553,6 +555,7 @@ export class RegimeDetector {
         previousRegime: this.prevRegime,
         selectionMethod: "override",
         overrideReason: "liquidityVacuumOverrideScore",
+        persistenceScore,
       };
       this.prevRegime = res.regime;
       this.pendingReversalConfirm = false;
@@ -568,6 +571,7 @@ export class RegimeDetector {
         previousRegime: this.prevRegime,
         selectionMethod: "override",
         overrideReason: "expiryOverrideScore",
+        persistenceScore,
       };
       this.prevRegime = res.regime;
       this.pendingReversalConfirm = false;
@@ -587,6 +591,7 @@ export class RegimeDetector {
       bestScore,
       scoreMargin: margin,
       previousRegime: this.prevRegime,
+      persistenceScore,
     };
 
     if (margin < cfg.minimumScoreMargin) {

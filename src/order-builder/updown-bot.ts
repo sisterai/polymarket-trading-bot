@@ -5,6 +5,58 @@ import { logger } from "../utils/logger";
 import { config } from "../config";
 import { WebSocketOrderBook, TokenPrice } from "../providers/websocketOrderbook";
 import { AdaptivePricePredictor, PricePrediction, MarketSnapshot } from "../utils/pricePredictor";
+import { lowSignalBlocksTrade, formatLowSignalBlockReason, formatChopMicroMetrics } from "../utils/low-signal-gate";
+import {
+    executionRiskDanger,
+    executionRiskSmallTradeAllowed,
+    capExecutionRiskSmallTradeSize,
+    formatExecutionRiskBlockReason,
+} from "../utils/execution-risk-gate";
+import {
+    expiryCloseWindow,
+    expiryCloseAllowsTrade,
+    capExpiryCloseSize,
+    formatExpiryCloseBlockReason,
+} from "../utils/expiry-close-gate";
+import {
+    evaluateFlowDominanceEntry,
+    computeFlowDominancePositionSize,
+    shouldExitFlowDominancePosition,
+    shouldForceExitByHoldDuration,
+    type FlowDominanceEntrySnapshot,
+} from "./strategies/flow-dominance";
+import {
+    evaluateMomentumEntry,
+    computeMomentumPositionSize,
+    shouldExitMomentumPosition,
+    shouldForceExitMomentumByHoldDuration,
+    type MomentumEntrySnapshot,
+} from "./strategies/momentum";
+import {
+    evaluateBreakoutEntry,
+    computeBreakoutPositionSize,
+    shouldExitBreakoutPosition,
+    shouldForceExitBreakoutByHoldDuration,
+    hadCompressionInRecentWindow,
+    COMPRESSION_LOOKBACK_EVENTS,
+    isCompression,
+    type BreakoutEntrySnapshot,
+    type BreakoutArmPending,
+} from "./strategies/breakout";
+import {
+    evaluateReversalEntry,
+    computeReversalPositionSize,
+    shouldExitReversalPosition,
+    shouldForceExitReversalByHoldDuration,
+    type ReversalEntrySnapshot,
+    type ReversalArmPending,
+} from "./strategies/reversal";
+
+type RegimeStrategyExec =
+    | { kind: "flow_dominance"; entrySnapshot: FlowDominanceEntrySnapshot; processTick: number }
+    | { kind: "momentum"; entrySnapshot: MomentumEntrySnapshot; processTick: number }
+    | { kind: "breakout"; entrySnapshot: BreakoutEntrySnapshot; processTick: number }
+    | { kind: "reversal"; entrySnapshot: ReversalEntrySnapshot; processTick: number };
 // Helper functions for market slug and token IDs
 /** Returns the ms epoch of the current 5-minute slot's start boundary. */
 function current5mSlotStartMs(): number {
@@ -153,6 +205,27 @@ export class UpDownPredictionBot {
     private tokenCountsByMarket: Map<string, { upTokenCount: number; downTokenCount: number }> = new Map(); // Track token counts per market
     private pausedMarkets: Set<string> = new Set(); // Track paused markets (reached max tokens per side)
     private readonly MAX_BUY_COUNTS_PER_SIDE: number; // Maximum buy counts per side per market (from config)
+
+    /** Increments on each call to updateAndPredictWithSnapshot (per market). Used for flow_dominance hold window. */
+    private marketProcessTick: Map<string, number> = new Map();
+    /** Active flow_dominance position: no pyramid until exit or max hold events. */
+    private flowDominanceHold: Map<string, { entryTick: number; snapshot: FlowDominanceEntrySnapshot }> = new Map();
+    /** Active momentum position: no pyramid until exit or max hold events (shorter window than flow). */
+    private momentumHold: Map<string, { entryTick: number; snapshot: MomentumEntrySnapshot }> = new Map();
+    /** Recent UP token asks for pullback filter (per market). */
+    private upAskHistory: Map<string, number[]> = new Map();
+    /** Recent compression flags for breakout (per market). */
+    private compressionHistory: Map<string, boolean[]> = new Map();
+    private breakoutHold: Map<string, { entryTick: number; snapshot: BreakoutEntrySnapshot }> = new Map();
+    /** Armed first spike; entry only after confirmation tick. */
+    private breakoutArmPending: Map<string, BreakoutArmPending> = new Map();
+
+    private reversalHold: Map<string, { entryTick: number; snapshot: ReversalEntrySnapshot }> = new Map();
+    private reversalArmPending: Map<string, ReversalArmPending> = new Map();
+    /** Per-market return1 series for reversal trend sum (microstructure). */
+    private return1History: Map<string, number[]> = new Map();
+    /** Prior tick |z| for exhaustion (ofi + microprice edge). */
+    private reversalPrevExhaustionZ: Map<string, { absOfiZ: number; absMicroZ: number }> = new Map();
 
     // Prediction scoring system
     private predictionScores: Map<string, {
@@ -420,10 +493,340 @@ export class UpDownPredictionBot {
 
             // Returns a prediction when a trigger fires (pole, momentum, or expiry regime)
             const prediction = predictor.updateAndPredictWithSnapshot(snapshot);
+            const prevTick = this.marketProcessTick.get(market) ?? 0;
+            const processTick = prevTick + 1;
+            this.marketProcessTick.set(market, processTick);
 
             if (!prediction) {
                 row.previousUpPrice = upAsk;
                 return;
+            }
+
+            let effectivePrediction: PricePrediction = prediction;
+            let shareSize = this.cfg.sharesPerSide;
+            let regimeExec: RegimeStrategyExec | undefined;
+
+            const hist = this.upAskHistory.get(market) ?? [];
+            const nextHist = [...hist, upAsk].slice(-24);
+            this.upAskHistory.set(market, nextHist);
+
+            const micro = predictor.getLatestMicrostructure();
+            const rr = predictor.getLatestRegimeResult();
+
+            if (micro) {
+                const compHist = this.compressionHistory.get(market) ?? [];
+                const nextComp = [...compHist, isCompression(micro)].slice(-48);
+                this.compressionHistory.set(market, nextComp);
+                const retHist = this.return1History.get(market) ?? [];
+                const nextRet = [...retHist, micro.raw.return1].slice(-48);
+                this.return1History.set(market, nextRet);
+            }
+            if (!rr || rr.regime !== "breakout") {
+                this.breakoutArmPending.delete(market);
+            }
+            if (!rr || rr.regime !== "reversal") {
+                this.reversalArmPending.delete(market);
+            }
+
+            if (effectivePrediction.regime === "flow_dominance" && micro && rr) {
+                let blockedByActiveHold = false;
+                if (this.flowDominanceHold.has(market)) {
+                    const h = this.flowDominanceHold.get(market)!;
+                    const ev = processTick - h.entryTick;
+                    const ex = shouldExitFlowDominancePosition(micro, h.snapshot);
+                    const force = shouldForceExitByHoldDuration(ev);
+                    if (ex.exit || force) {
+                        logger.info(
+                            `📉 flow_dominance EXIT: ${ex.reason ?? "max hold events"} (eventsHeld=${ev})`,
+                        );
+                        this.flowDominanceHold.delete(market);
+                    } else {
+                        blockedByActiveHold = true;
+                    }
+                }
+
+                if (blockedByActiveHold) {
+                    effectivePrediction = {
+                        ...effectivePrediction,
+                        signal: "HOLD",
+                        blockedBySafetyGate: true,
+                        safetyBlockReason: "flow_dominance: active position (no pyramid)",
+                    };
+                } else {
+                    const fd = evaluateFlowDominanceEntry(micro, rr);
+                    if (fd.shouldEnter) {
+                        effectivePrediction = {
+                            ...effectivePrediction,
+                            signal: fd.signal,
+                            direction: fd.direction,
+                            confidence: fd.confidence,
+                            blockedBySafetyGate: undefined,
+                            safetyBlockReason: undefined,
+                        };
+                        shareSize = computeFlowDominancePositionSize(
+                            this.cfg.sharesPerSide,
+                            fd.entryScore,
+                            rr.bestScore,
+                        );
+                        regimeExec = { kind: "flow_dominance", entrySnapshot: fd.entrySnapshot, processTick };
+                        logger.info(`📈 flow_dominance ENTRY: ${fd.reason}`);
+                    } else {
+                        effectivePrediction = {
+                            ...effectivePrediction,
+                            signal: "HOLD",
+                            blockedBySafetyGate: true,
+                            safetyBlockReason: fd.blockReason ?? "flow_dominance: entry not met",
+                        };
+                    }
+                }
+            } else if (effectivePrediction.regime === "momentum" && micro && rr) {
+                let blockedByMomentumHold = false;
+                if (this.momentumHold.has(market)) {
+                    const h = this.momentumHold.get(market)!;
+                    const ev = processTick - h.entryTick;
+                    const ex = shouldExitMomentumPosition(micro, h.snapshot, rr.persistenceScore ?? 0);
+                    const force = shouldForceExitMomentumByHoldDuration(ev);
+                    if (ex.exit || force) {
+                        logger.info(
+                            `📉 momentum EXIT: ${ex.reason ?? "max hold events"} (eventsHeld=${ev})`,
+                        );
+                        this.momentumHold.delete(market);
+                    } else {
+                        blockedByMomentumHold = true;
+                    }
+                }
+
+                if (blockedByMomentumHold) {
+                    effectivePrediction = {
+                        ...effectivePrediction,
+                        signal: "HOLD",
+                        blockedBySafetyGate: true,
+                        safetyBlockReason: "momentum: active position (no pyramid)",
+                    };
+                } else {
+                    const mom = evaluateMomentumEntry(micro, rr, nextHist);
+                    if (mom.shouldEnter) {
+                        effectivePrediction = {
+                            ...effectivePrediction,
+                            signal: mom.signal,
+                            direction: mom.direction,
+                            confidence: mom.confidence,
+                            blockedBySafetyGate: undefined,
+                            safetyBlockReason: undefined,
+                        };
+                        shareSize = computeMomentumPositionSize(this.cfg.sharesPerSide, mom.momentumScore);
+                        regimeExec = { kind: "momentum", entrySnapshot: mom.entrySnapshot, processTick };
+                        logger.info(`📈 momentum ENTRY: ${mom.reason}`);
+                    } else {
+                        effectivePrediction = {
+                            ...effectivePrediction,
+                            signal: "HOLD",
+                            blockedBySafetyGate: true,
+                            safetyBlockReason: mom.blockReason ?? "momentum: entry not met",
+                        };
+                    }
+                }
+            } else if (effectivePrediction.regime === "breakout" && micro && rr) {
+                let blockedByBreakoutHold = false;
+                if (this.breakoutHold.has(market)) {
+                    const h = this.breakoutHold.get(market)!;
+                    const ev = processTick - h.entryTick;
+                    const ex = shouldExitBreakoutPosition(micro, h.snapshot);
+                    const force = shouldForceExitBreakoutByHoldDuration(ev);
+                    if (ex.exit || force) {
+                        logger.info(
+                            `📉 breakout EXIT: ${ex.reason ?? "max hold events"} (eventsHeld=${ev})`,
+                        );
+                        this.breakoutHold.delete(market);
+                    } else {
+                        blockedByBreakoutHold = true;
+                    }
+                }
+
+                if (blockedByBreakoutHold) {
+                    this.breakoutArmPending.delete(market);
+                    effectivePrediction = {
+                        ...effectivePrediction,
+                        signal: "HOLD",
+                        blockedBySafetyGate: true,
+                        safetyBlockReason: "breakout: active position (no pyramid)",
+                    };
+                } else {
+                    const compSeries = this.compressionHistory.get(market) ?? [];
+                    const hadCompression = hadCompressionInRecentWindow(compSeries, COMPRESSION_LOOKBACK_EVENTS);
+                    const pending = this.breakoutArmPending.get(market) ?? null;
+                    const bo = evaluateBreakoutEntry(micro, rr, hadCompression, pending, processTick);
+                    if (bo.pendingNext === null) {
+                        this.breakoutArmPending.delete(market);
+                    } else {
+                        this.breakoutArmPending.set(market, bo.pendingNext);
+                    }
+                    if (bo.shouldEnter && bo.entrySnapshot) {
+                        effectivePrediction = {
+                            ...effectivePrediction,
+                            signal: bo.signal,
+                            direction: bo.direction,
+                            confidence: bo.confidence,
+                            blockedBySafetyGate: undefined,
+                            safetyBlockReason: undefined,
+                        };
+                        shareSize = computeBreakoutPositionSize(this.cfg.sharesPerSide);
+                        regimeExec = { kind: "breakout", entrySnapshot: bo.entrySnapshot, processTick };
+                        logger.info(`📈 breakout ENTRY: ${bo.reason}`);
+                    } else {
+                        effectivePrediction = {
+                            ...effectivePrediction,
+                            signal: "HOLD",
+                            blockedBySafetyGate: true,
+                            safetyBlockReason: bo.blockReason ?? "breakout: entry not met",
+                        };
+                    }
+                }
+            } else if (effectivePrediction.regime === "reversal" && micro && rr) {
+                let blockedByReversalHold = false;
+                if (this.reversalHold.has(market)) {
+                    const h = this.reversalHold.get(market)!;
+                    const ev = processTick - h.entryTick;
+                    const retSeries = this.return1History.get(market) ?? [];
+                    const ex = shouldExitReversalPosition(micro, h.snapshot, retSeries);
+                    const force = shouldForceExitReversalByHoldDuration(ev);
+                    if (ex.exit || force) {
+                        logger.info(
+                            `📉 reversal EXIT: ${ex.reason ?? "max hold events"} (eventsHeld=${ev})`,
+                        );
+                        this.reversalHold.delete(market);
+                    } else {
+                        blockedByReversalHold = true;
+                    }
+                }
+
+                if (blockedByReversalHold) {
+                    this.reversalArmPending.delete(market);
+                    effectivePrediction = {
+                        ...effectivePrediction,
+                        signal: "HOLD",
+                        blockedBySafetyGate: true,
+                        safetyBlockReason: "reversal: active position (no pyramid)",
+                    };
+                } else {
+                    const retSeries = this.return1History.get(market) ?? [];
+                    const prevZ = this.reversalPrevExhaustionZ.get(market) ?? null;
+                    const pending = this.reversalArmPending.get(market) ?? null;
+                    const rev = evaluateReversalEntry(micro, rr, retSeries, prevZ, pending, processTick);
+                    if (rev.pendingNext === null) {
+                        this.reversalArmPending.delete(market);
+                    } else {
+                        this.reversalArmPending.set(market, rev.pendingNext);
+                    }
+                    if (rev.shouldEnter && rev.entrySnapshot) {
+                        effectivePrediction = {
+                            ...effectivePrediction,
+                            signal: rev.signal,
+                            direction: rev.direction,
+                            confidence: rev.confidence,
+                            blockedBySafetyGate: undefined,
+                            safetyBlockReason: undefined,
+                        };
+                        shareSize = computeReversalPositionSize(this.cfg.sharesPerSide);
+                        regimeExec = { kind: "reversal", entrySnapshot: rev.entrySnapshot, processTick };
+                        logger.info(`📈 reversal ENTRY: ${rev.reason}`);
+                    } else {
+                        effectivePrediction = {
+                            ...effectivePrediction,
+                            signal: "HOLD",
+                            blockedBySafetyGate: true,
+                            safetyBlockReason: rev.blockReason ?? "reversal: entry not met",
+                        };
+                    }
+                }
+            }
+
+            if (micro) {
+                this.reversalPrevExhaustionZ.set(market, {
+                    absOfiZ: Math.abs(micro.zOfiNorm),
+                    absMicroZ: Math.abs(micro.zMicropriceEdge),
+                });
+            }
+
+            // Low-signal no-trade: chop, weak best score, or tight margin — HOLD (overrides regime strategies).
+            if (rr && lowSignalBlocksTrade(rr)) {
+                const reason = formatLowSignalBlockReason(rr);
+                const hadRegimeExec = regimeExec !== undefined;
+                effectivePrediction = {
+                    ...effectivePrediction,
+                    signal: "HOLD",
+                    blockedBySafetyGate: true,
+                    safetyBlockReason: reason,
+                };
+                regimeExec = undefined;
+                if (rr.regime === "chop" && micro) {
+                    logger.debug(formatChopMicroMetrics(micro));
+                }
+                if (hadRegimeExec) {
+                    logger.info(`🚫 NO_TRADE: ${reason} (overrode regime strategy)`);
+                } else {
+                    logger.debug(`🚫 NO_TRADE: ${reason}`);
+                }
+            }
+
+            // Execution risk (final gate): thin / dangerous book — overrides prediction; HOLD unless extreme flow_dominance score (≤30% base).
+            if (rr && executionRiskDanger(rr, micro)) {
+                if (!executionRiskSmallTradeAllowed(rr)) {
+                    const hadRegimeExec = regimeExec !== undefined;
+                    const reason = formatExecutionRiskBlockReason(rr, micro);
+                    effectivePrediction = {
+                        ...effectivePrediction,
+                        signal: "HOLD",
+                        blockedBySafetyGate: true,
+                        safetyBlockReason: reason,
+                    };
+                    regimeExec = undefined;
+                    if (hadRegimeExec) {
+                        logger.info(`🚫 NO_TRADE: ${reason} (overrode regime strategy)`);
+                    } else {
+                        logger.debug(`🚫 NO_TRADE: ${reason}`);
+                    }
+                } else {
+                    const base = this.cfg.sharesPerSide;
+                    const prev = shareSize ?? base;
+                    shareSize = capExecutionRiskSmallTradeSize(base, prev);
+                    const fd = rr.scores?.flow_dominance ?? 0;
+                    if (regimeExec !== undefined || effectivePrediction.signal !== "HOLD") {
+                        logger.info(
+                            `⚠️ EXECUTION RISK: small-trade cap size=${shareSize} (flow_dominance=${fd.toFixed(2)}>=0.80)`,
+                        );
+                    }
+                }
+            }
+
+            // End-of-round: default HOLD when <20s to expiry; optional trade only with strong flow + tight spread + depth (≤50% base).
+            if (rr && micro && expiryCloseWindow(micro)) {
+                if (!expiryCloseAllowsTrade(rr, micro)) {
+                    const hadRegimeExec = regimeExec !== undefined;
+                    const reason = formatExpiryCloseBlockReason(micro);
+                    effectivePrediction = {
+                        ...effectivePrediction,
+                        signal: "HOLD",
+                        blockedBySafetyGate: true,
+                        safetyBlockReason: reason,
+                    };
+                    regimeExec = undefined;
+                    if (hadRegimeExec) {
+                        logger.info(`🚫 NO_TRADE: ${reason} (overrode regime strategy)`);
+                    } else {
+                        logger.debug(`🚫 NO_TRADE: ${reason}`);
+                    }
+                } else {
+                    const base = this.cfg.sharesPerSide;
+                    const prev = shareSize ?? base;
+                    shareSize = capExpiryCloseSize(base, prev);
+                    const fd = rr.scores?.flow_dominance ?? 0;
+                    if (regimeExec !== undefined || effectivePrediction.signal !== "HOLD") {
+                        logger.info(
+                            `⚠️ EXPIRY-CLOSE: size cap=${shareSize} (flow_dominance=${fd.toFixed(2)}, spread/depth OK)`,
+                        );
+                    }
+                }
             }
 
             // Track prediction for accuracy calculation.
@@ -444,17 +847,17 @@ export class UpDownPredictionBot {
 
             // Store current prediction for next evaluation
             this.lastPredictions.set(market, {
-                prediction,
+                prediction: effectivePrediction,
                 actualPrice: upAsk,
                 timestamp: Date.now(),
             });
 
-            const bestEdge = Math.max(prediction.edgeBuyUp, prediction.edgeBuyDown);
-            const triggerType = prediction.isPoleValue ? "POLE" : prediction.regime.toUpperCase();
-            logger.info(`🔮 PREDICT [${triggerType}]: regime=${prediction.regime} (conf=${prediction.regimeConfidence.toFixed(2)}, margin=${prediction.regimeScoreMargin.toFixed(2)}) | pUp=${prediction.pUp.toFixed(3)} | Edge=${(bestEdge * 100).toFixed(1)}% | Dir: ${prediction.direction.toUpperCase()} | Signal: ${prediction.signal}${prediction.blockedBySafetyGate ? ` [BLOCKED: ${prediction.safetyBlockReason}]` : ""} | Pred: ${prediction.predictedPrice.toFixed(4)} (cur: ${upAsk.toFixed(4)})`);
+            const bestEdge = Math.max(effectivePrediction.edgeBuyUp, effectivePrediction.edgeBuyDown);
+            const triggerType = effectivePrediction.isPoleValue ? "POLE" : effectivePrediction.regime.toUpperCase();
+            logger.info(`🔮 PREDICT [${triggerType}]: regime=${effectivePrediction.regime} (conf=${effectivePrediction.regimeConfidence.toFixed(2)}, margin=${effectivePrediction.regimeScoreMargin.toFixed(2)}) | pUp=${effectivePrediction.pUp.toFixed(3)} | Edge=${(bestEdge * 100).toFixed(1)}% | Dir: ${effectivePrediction.direction.toUpperCase()} | Signal: ${effectivePrediction.signal}${effectivePrediction.blockedBySafetyGate ? ` [BLOCKED: ${effectivePrediction.safetyBlockReason}]` : ""} | Pred: ${effectivePrediction.predictedPrice.toFixed(4)} (cur: ${upAsk.toFixed(4)})`);
 
             // Execute prediction-based trading strategy
-            this.executePredictionTrade(market, slug, prediction, upAsk, downAsk, currentTokenIds);
+            this.executePredictionTrade(market, slug, effectivePrediction, upAsk, downAsk, currentTokenIds, shareSize, regimeExec);
 
             // Log diagnostics periodically
             const diagStats = predictor.getDiagnostics().getStats();
@@ -542,6 +945,17 @@ export class UpDownPredictionBot {
             if (predictor) {
                 predictor.reset();
             }
+            this.marketProcessTick.delete(market);
+            this.flowDominanceHold.delete(market);
+            this.momentumHold.delete(market);
+            this.upAskHistory.delete(market);
+            this.compressionHistory.delete(market);
+            this.breakoutHold.delete(market);
+            this.breakoutArmPending.delete(market);
+            this.reversalHold.delete(market);
+            this.reversalArmPending.delete(market);
+            this.return1History.delete(market);
+            this.reversalPrevExhaustionZ.delete(market);
 
             logger.info(`✅ Market ${market} re-initialized with new token IDs for cycle ${newSlug}`);
         } catch (e) {
@@ -595,6 +1009,7 @@ export class UpDownPredictionBot {
      * Execute prediction-based trading strategy
      * When prediction says UP → buy UP token, then at next prediction buy DOWN token
      * When prediction says DOWN → buy DOWN token, then at next prediction buy UP token
+     * `shareSize` defaults to config; regime strategies may scale size.
      */
     private executePredictionTrade(
         market: string,
@@ -603,7 +1018,10 @@ export class UpDownPredictionBot {
         upAsk: number,
         downAsk: number,
         tokenIds: { upTokenId: string; downTokenId: string; conditionId: string; upIdx: number; downIdx: number },
+        shareSize?: number,
+        regimeExec?: RegimeStrategyExec,
     ): void {
+        const size = shareSize ?? this.cfg.sharesPerSide;
         // Initialize prediction score for this market/slug if not exists
         const scoreKey = `${market}-${slug}`;
         if (!this.predictionScores.has(scoreKey)) {
@@ -698,14 +1116,14 @@ export class UpDownPredictionBot {
         }
 
         // Execute the buy
-        const buyCost = buyPrice * this.cfg.sharesPerSide;
-        logger.info(`🎯 FIRST-SIDE Trade: ${buyToken} @ ${buyPrice.toFixed(4)} (${buyCost.toFixed(2)} USDC) | UP ${tokenCounts.upTokenCount}/${this.MAX_BUY_COUNTS_PER_SIDE}, DOWN ${tokenCounts.downTokenCount}/${this.MAX_BUY_COUNTS_PER_SIDE} | Limit: ${this.MAX_BUY_COUNTS_PER_SIDE} per side`);
+        const buyCost = buyPrice * size;
+        logger.info(`🎯 FIRST-SIDE Trade: ${buyToken} @ ${buyPrice.toFixed(4)} (${buyCost.toFixed(2)} USDC) | size=${size} | UP ${tokenCounts.upTokenCount}/${this.MAX_BUY_COUNTS_PER_SIDE}, DOWN ${tokenCounts.downTokenCount}/${this.MAX_BUY_COUNTS_PER_SIDE} | Limit: ${this.MAX_BUY_COUNTS_PER_SIDE} per side`);
 
         this.buyShares(
             buyToken === "UP" ? "YES" : "NO",
             tokenId,
             buyPrice,
-            this.cfg.sharesPerSide,
+            size,
         );
 
         // Place second-side limit order IMMEDIATELY (within 50ms) without waiting for first order response.
@@ -720,8 +1138,34 @@ export class UpDownPredictionBot {
             market,
             slug,
             scoreKey,
-            tokenCounts
+            tokenCounts,
+            size,
         );
+
+        if (regimeExec?.kind === "flow_dominance") {
+            this.flowDominanceHold.set(market, {
+                entryTick: regimeExec.processTick,
+                snapshot: regimeExec.entrySnapshot,
+            });
+        }
+        if (regimeExec?.kind === "momentum") {
+            this.momentumHold.set(market, {
+                entryTick: regimeExec.processTick,
+                snapshot: regimeExec.entrySnapshot,
+            });
+        }
+        if (regimeExec?.kind === "breakout") {
+            this.breakoutHold.set(market, {
+                entryTick: regimeExec.processTick,
+                snapshot: regimeExec.entrySnapshot,
+            });
+        }
+        if (regimeExec?.kind === "reversal") {
+            this.reversalHold.set(market, {
+                entryTick: regimeExec.processTick,
+                snapshot: regimeExec.entrySnapshot,
+            });
+        }
 
         // Track the trade cost for the side we actually bought only
         if (buyToken === "UP") {
@@ -760,7 +1204,8 @@ export class UpDownPredictionBot {
         market: string,
         slug: string,
         scoreKey: string,
-        tokenCounts: { upTokenCount: number; downTokenCount: number }
+        tokenCounts: { upTokenCount: number; downTokenCount: number },
+        orderSize: number,
     ): Promise<void> {
         // Determine opposite side
         const oppositeSide = firstSide === "UP" ? "DOWN" : "UP";
@@ -795,7 +1240,7 @@ export class UpDownPredictionBot {
             tokenID: oppositeTokenId,
             side: Side.BUY,
             price: limitPrice,
-            size: this.cfg.sharesPerSide,
+            size: orderSize,
         };
 
         try {
@@ -808,7 +1253,7 @@ export class UpDownPredictionBot {
             
             const orderID = response?.orderID;
             // Log second-side limit order placement clearly with limit info
-            const limitCost = limitPrice * this.cfg.sharesPerSide;
+            const limitCost = limitPrice * orderSize;
             if (orderID) {
                 logger.info(`📋 SECOND-SIDE Limit Order: ${oppositeSide} @ ${limitPrice.toFixed(4)} (${limitCost.toFixed(2)} USDC) | First-Side: ${firstSide} @ ${firstSidePrice.toFixed(4)} | Current: UP ${tokenCounts.upTokenCount}/${this.MAX_BUY_COUNTS_PER_SIDE}, DOWN ${tokenCounts.downTokenCount}/${this.MAX_BUY_COUNTS_PER_SIDE} | Limit: ${this.MAX_BUY_COUNTS_PER_SIDE} per side | OrderID: ${orderID.substring(0, 10)}...`);
                 // Track second-side limit so fills update score (downTokenCost/upTokenCost and counts)
@@ -818,7 +1263,7 @@ export class UpDownPredictionBot {
                     leg,
                     oppositeTokenId,
                     tokenIds.conditionId,
-                    this.cfg.sharesPerSide,
+                    orderSize,
                     limitPrice,
                     market,
                     slug,
