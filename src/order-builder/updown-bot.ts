@@ -1,7 +1,8 @@
 import { ClobClient, CreateOrderOptions, OrderType, Side, UserOrder } from "@polymarket/clob-client";
+import chalk from "chalk";
 import * as fs from "fs";
 import * as path from "path";
-import { logger } from "../utils/logger";
+import { logger, colorRegime, colorStrategy, colorSignal } from "../utils/logger";
 import { config } from "../config";
 import { WebSocketOrderBook, TokenPrice } from "../providers/websocketOrderbook";
 import { AdaptivePricePredictor, PricePrediction, MarketSnapshot } from "../utils/pricePredictor";
@@ -57,6 +58,14 @@ type RegimeStrategyExec =
     | { kind: "momentum"; entrySnapshot: MomentumEntrySnapshot; processTick: number }
     | { kind: "breakout"; entrySnapshot: BreakoutEntrySnapshot; processTick: number }
     | { kind: "reversal"; entrySnapshot: ReversalEntrySnapshot; processTick: number };
+
+type RuntimeRegimeState = {
+    confirmed: PricePrediction["regime"] | null;
+    candidate: PricePrediction["regime"] | null;
+    candidateCount: number;
+    cooldownUntilTick: number;
+    chopSeenTick: number | null;
+};
 // Helper functions for market slug and token IDs
 /** Returns the ms epoch of the current 5-minute slot's start boundary. */
 function current5mSlotStartMs(): number {
@@ -226,6 +235,12 @@ export class UpDownPredictionBot {
     private return1History: Map<string, number[]> = new Map();
     /** Prior tick |z| for exhaustion (ofi + microprice edge). */
     private reversalPrevExhaustionZ: Map<string, { absOfiZ: number; absMicroZ: number }> = new Map();
+    /** Regime transition controller state (per market). */
+    private regimeStateByMarket: Map<string, RuntimeRegimeState> = new Map();
+
+    private static readonly REGIME_CONFIRM_TICKS = 2;
+    private static readonly CHOP_FORCE_EXIT_GRACE_TICKS = 1;
+    private static readonly COOLDOWN_TICKS_AFTER_DERISK = 4;
 
     // Prediction scoring system
     private predictionScores: Map<string, {
@@ -337,6 +352,79 @@ export class UpDownPredictionBot {
             this.wsOrderBook.disconnect();
         }
         logger.info("UpDownPredictionBot stopped");
+    }
+
+    private getRuntimeRegimeState(market: string): RuntimeRegimeState {
+        let st = this.regimeStateByMarket.get(market);
+        if (!st) {
+            st = {
+                confirmed: null,
+                candidate: null,
+                candidateCount: 0,
+                cooldownUntilTick: 0,
+                chopSeenTick: null,
+            };
+            this.regimeStateByMarket.set(market, st);
+        }
+        return st;
+    }
+
+    private updateConfirmedRegime(
+        market: string,
+        detected: PricePrediction["regime"],
+    ): PricePrediction["regime"] {
+        const st = this.getRuntimeRegimeState(market);
+        const immediate = detected === "liquidity_vacuum" || detected === "expiry";
+        if (immediate) {
+            st.confirmed = detected;
+            st.candidate = null;
+            st.candidateCount = 0;
+            return detected;
+        }
+
+        if (st.confirmed === null) {
+            st.confirmed = detected;
+            st.candidate = null;
+            st.candidateCount = 0;
+            return detected;
+        }
+
+        if (detected === st.confirmed) {
+            st.candidate = null;
+            st.candidateCount = 0;
+            return st.confirmed;
+        }
+
+        if (st.candidate === detected) {
+            st.candidateCount++;
+        } else {
+            st.candidate = detected;
+            st.candidateCount = 1;
+        }
+
+        if (st.candidateCount >= UpDownPredictionBot.REGIME_CONFIRM_TICKS) {
+            st.confirmed = detected;
+            st.candidate = null;
+            st.candidateCount = 0;
+        }
+
+        return st.confirmed;
+    }
+
+    private hasAnyDirectionalHold(market: string): boolean {
+        return this.flowDominanceHold.has(market) ||
+            this.momentumHold.has(market) ||
+            this.breakoutHold.has(market) ||
+            this.reversalHold.has(market);
+    }
+
+    private clearDirectionalState(market: string): void {
+        this.flowDominanceHold.delete(market);
+        this.momentumHold.delete(market);
+        this.breakoutHold.delete(market);
+        this.reversalHold.delete(market);
+        this.breakoutArmPending.delete(market);
+        this.reversalArmPending.delete(market);
     }
 
     private async initializeMarket(market: string): Promise<void> {
@@ -506,20 +594,36 @@ export class UpDownPredictionBot {
             let shareSize = this.cfg.sharesPerSide;
             let regimeExec: RegimeStrategyExec | undefined;
 
-            const hist = this.upAskHistory.get(market) ?? [];
-            const nextHist = [...hist, upAsk].slice(-24);
-            this.upAskHistory.set(market, nextHist);
+            let nextHist = this.upAskHistory.get(market);
+            if (!nextHist) {
+                nextHist = [];
+                this.upAskHistory.set(market, nextHist);
+            }
+            nextHist.push(upAsk);
+            if (nextHist.length > 24) nextHist.shift();
 
             const micro = predictor.getLatestMicrostructure();
             const rr = predictor.getLatestRegimeResult();
+            const detectedRegime = (rr?.regime ?? effectivePrediction.regime) as PricePrediction["regime"];
+            const confirmedRegime = this.updateConfirmedRegime(market, detectedRegime);
+            const regimeState = this.getRuntimeRegimeState(market);
 
             if (micro) {
-                const compHist = this.compressionHistory.get(market) ?? [];
-                const nextComp = [...compHist, isCompression(micro)].slice(-48);
-                this.compressionHistory.set(market, nextComp);
-                const retHist = this.return1History.get(market) ?? [];
-                const nextRet = [...retHist, micro.raw.return1].slice(-48);
-                this.return1History.set(market, nextRet);
+                let nextComp = this.compressionHistory.get(market);
+                if (!nextComp) {
+                    nextComp = [];
+                    this.compressionHistory.set(market, nextComp);
+                }
+                nextComp.push(isCompression(micro));
+                if (nextComp.length > 48) nextComp.shift();
+
+                let nextRet = this.return1History.get(market);
+                if (!nextRet) {
+                    nextRet = [];
+                    this.return1History.set(market, nextRet);
+                }
+                nextRet.push(micro.raw.return1);
+                if (nextRet.length > 48) nextRet.shift();
             }
             if (!rr || rr.regime !== "breakout") {
                 this.breakoutArmPending.delete(market);
@@ -528,7 +632,59 @@ export class UpDownPredictionBot {
                 this.reversalArmPending.delete(market);
             }
 
-            if (effectivePrediction.regime === "flow_dominance" && micro && rr) {
+            // Transition safety actions: de-risk quickly on hostile regime flips.
+            let forcedTransitionBlockReason: string | undefined;
+            const hasHold = this.hasAnyDirectionalHold(market);
+            if (confirmedRegime === "liquidity_vacuum" && hasHold) {
+                this.clearDirectionalState(market);
+                regimeState.cooldownUntilTick = processTick + UpDownPredictionBot.COOLDOWN_TICKS_AFTER_DERISK;
+                regimeState.chopSeenTick = null;
+                forcedTransitionBlockReason = "transition: liquidity_vacuum de-risk";
+                logger.warning(`🛑 TRANSITION EXIT: liquidity_vacuum -> clear holds, cooldown=${UpDownPredictionBot.COOLDOWN_TICKS_AFTER_DERISK} ticks`);
+            } else if (confirmedRegime === "chop" && hasHold) {
+                if (regimeState.chopSeenTick === null) {
+                    regimeState.chopSeenTick = processTick;
+                }
+                const chopAge = processTick - regimeState.chopSeenTick;
+                if (chopAge >= UpDownPredictionBot.CHOP_FORCE_EXIT_GRACE_TICKS) {
+                    this.clearDirectionalState(market);
+                    regimeState.cooldownUntilTick = processTick + UpDownPredictionBot.COOLDOWN_TICKS_AFTER_DERISK;
+                    forcedTransitionBlockReason = "transition: chop persistence de-risk";
+                    logger.info(`🛑 TRANSITION EXIT: chop persisted (${chopAge} ticks) -> clear holds, cooldown=${UpDownPredictionBot.COOLDOWN_TICKS_AFTER_DERISK} ticks`);
+                }
+            } else if (confirmedRegime !== "chop") {
+                regimeState.chopSeenTick = null;
+            }
+
+            const directionalRegime =
+                confirmedRegime === "flow_dominance" ||
+                confirmedRegime === "momentum" ||
+                confirmedRegime === "breakout" ||
+                confirmedRegime === "reversal";
+            const cooldownActive = processTick < regimeState.cooldownUntilTick;
+            const blockedByCooldown = cooldownActive && directionalRegime;
+            const strategyRegime: PricePrediction["regime"] = blockedByCooldown ? "chop" : confirmedRegime;
+            effectivePrediction = {
+                ...effectivePrediction,
+                regime: strategyRegime,
+            };
+            if (forcedTransitionBlockReason) {
+                effectivePrediction = {
+                    ...effectivePrediction,
+                    signal: "HOLD",
+                    blockedBySafetyGate: true,
+                    safetyBlockReason: forcedTransitionBlockReason,
+                };
+            } else if (blockedByCooldown) {
+                effectivePrediction = {
+                    ...effectivePrediction,
+                    signal: "HOLD",
+                    blockedBySafetyGate: true,
+                    safetyBlockReason: `transition: cooldown ${regimeState.cooldownUntilTick - processTick} ticks`,
+                };
+            }
+
+            if (!blockedByCooldown && !forcedTransitionBlockReason && strategyRegime === "flow_dominance" && micro && rr) {
                 let blockedByActiveHold = false;
                 if (this.flowDominanceHold.has(market)) {
                     const h = this.flowDominanceHold.get(market)!;
@@ -537,7 +693,7 @@ export class UpDownPredictionBot {
                     const force = shouldForceExitByHoldDuration(ev);
                     if (ex.exit || force) {
                         logger.info(
-                            `📉 flow_dominance EXIT: ${ex.reason ?? "max hold events"} (eventsHeld=${ev})`,
+                            `📉 ${colorStrategy("flow_dominance")} EXIT: ${ex.reason ?? "max hold events"} (eventsHeld=${ev})`,
                         );
                         this.flowDominanceHold.delete(market);
                     } else {
@@ -569,7 +725,7 @@ export class UpDownPredictionBot {
                             rr.bestScore,
                         );
                         regimeExec = { kind: "flow_dominance", entrySnapshot: fd.entrySnapshot, processTick };
-                        logger.info(`📈 flow_dominance ENTRY: ${fd.reason}`);
+                        logger.info(`📈 ${colorStrategy("flow_dominance")} ENTRY: ${fd.reason}`);
                     } else {
                         effectivePrediction = {
                             ...effectivePrediction,
@@ -579,7 +735,7 @@ export class UpDownPredictionBot {
                         };
                     }
                 }
-            } else if (effectivePrediction.regime === "momentum" && micro && rr) {
+            } else if (!blockedByCooldown && !forcedTransitionBlockReason && strategyRegime === "momentum" && micro && rr) {
                 let blockedByMomentumHold = false;
                 if (this.momentumHold.has(market)) {
                     const h = this.momentumHold.get(market)!;
@@ -588,7 +744,7 @@ export class UpDownPredictionBot {
                     const force = shouldForceExitMomentumByHoldDuration(ev);
                     if (ex.exit || force) {
                         logger.info(
-                            `📉 momentum EXIT: ${ex.reason ?? "max hold events"} (eventsHeld=${ev})`,
+                            `📉 ${colorStrategy("momentum")} EXIT: ${ex.reason ?? "max hold events"} (eventsHeld=${ev})`,
                         );
                         this.momentumHold.delete(market);
                     } else {
@@ -616,7 +772,7 @@ export class UpDownPredictionBot {
                         };
                         shareSize = computeMomentumPositionSize(this.cfg.sharesPerSide, mom.momentumScore);
                         regimeExec = { kind: "momentum", entrySnapshot: mom.entrySnapshot, processTick };
-                        logger.info(`📈 momentum ENTRY: ${mom.reason}`);
+                        logger.info(`📈 ${colorStrategy("momentum")} ENTRY: ${mom.reason}`);
                     } else {
                         effectivePrediction = {
                             ...effectivePrediction,
@@ -626,7 +782,7 @@ export class UpDownPredictionBot {
                         };
                     }
                 }
-            } else if (effectivePrediction.regime === "breakout" && micro && rr) {
+            } else if (!blockedByCooldown && !forcedTransitionBlockReason && strategyRegime === "breakout" && micro && rr) {
                 let blockedByBreakoutHold = false;
                 if (this.breakoutHold.has(market)) {
                     const h = this.breakoutHold.get(market)!;
@@ -635,7 +791,7 @@ export class UpDownPredictionBot {
                     const force = shouldForceExitBreakoutByHoldDuration(ev);
                     if (ex.exit || force) {
                         logger.info(
-                            `📉 breakout EXIT: ${ex.reason ?? "max hold events"} (eventsHeld=${ev})`,
+                            `📉 ${colorStrategy("breakout")} EXIT: ${ex.reason ?? "max hold events"} (eventsHeld=${ev})`,
                         );
                         this.breakoutHold.delete(market);
                     } else {
@@ -672,7 +828,7 @@ export class UpDownPredictionBot {
                         };
                         shareSize = computeBreakoutPositionSize(this.cfg.sharesPerSide);
                         regimeExec = { kind: "breakout", entrySnapshot: bo.entrySnapshot, processTick };
-                        logger.info(`📈 breakout ENTRY: ${bo.reason}`);
+                        logger.info(`📈 ${colorStrategy("breakout")} ENTRY: ${bo.reason}`);
                     } else {
                         effectivePrediction = {
                             ...effectivePrediction,
@@ -682,7 +838,7 @@ export class UpDownPredictionBot {
                         };
                     }
                 }
-            } else if (effectivePrediction.regime === "reversal" && micro && rr) {
+            } else if (!blockedByCooldown && !forcedTransitionBlockReason && strategyRegime === "reversal" && micro && rr) {
                 let blockedByReversalHold = false;
                 if (this.reversalHold.has(market)) {
                     const h = this.reversalHold.get(market)!;
@@ -692,7 +848,7 @@ export class UpDownPredictionBot {
                     const force = shouldForceExitReversalByHoldDuration(ev);
                     if (ex.exit || force) {
                         logger.info(
-                            `📉 reversal EXIT: ${ex.reason ?? "max hold events"} (eventsHeld=${ev})`,
+                            `📉 ${colorStrategy("reversal")} EXIT: ${ex.reason ?? "max hold events"} (eventsHeld=${ev})`,
                         );
                         this.reversalHold.delete(market);
                     } else {
@@ -729,7 +885,7 @@ export class UpDownPredictionBot {
                         };
                         shareSize = computeReversalPositionSize(this.cfg.sharesPerSide);
                         regimeExec = { kind: "reversal", entrySnapshot: rev.entrySnapshot, processTick };
-                        logger.info(`📈 reversal ENTRY: ${rev.reason}`);
+                        logger.info(`📈 ${colorStrategy("reversal")} ENTRY: ${rev.reason}`);
                     } else {
                         effectivePrediction = {
                             ...effectivePrediction,
@@ -854,7 +1010,12 @@ export class UpDownPredictionBot {
 
             const bestEdge = Math.max(effectivePrediction.edgeBuyUp, effectivePrediction.edgeBuyDown);
             const triggerType = effectivePrediction.isPoleValue ? "POLE" : effectivePrediction.regime.toUpperCase();
-            logger.info(`🔮 PREDICT [${triggerType}]: regime=${effectivePrediction.regime} (conf=${effectivePrediction.regimeConfidence.toFixed(2)}, margin=${effectivePrediction.regimeScoreMargin.toFixed(2)}) | pUp=${effectivePrediction.pUp.toFixed(3)} | Edge=${(bestEdge * 100).toFixed(1)}% | Dir: ${effectivePrediction.direction.toUpperCase()} | Signal: ${effectivePrediction.signal}${effectivePrediction.blockedBySafetyGate ? ` [BLOCKED: ${effectivePrediction.safetyBlockReason}]` : ""} | Pred: ${effectivePrediction.predictedPrice.toFixed(4)} (cur: ${upAsk.toFixed(4)})`);
+            const coloredRegime = colorRegime(effectivePrediction.regime);
+            const coloredSignal = colorSignal(effectivePrediction.signal);
+            const blockedText = effectivePrediction.blockedBySafetyGate
+                ? ` ${chalk.bgRed.white.bold("[BLOCKED]")} ${chalk.redBright(effectivePrediction.safetyBlockReason ?? "")}`
+                : "";
+            logger.info(`🔮 PREDICT [${triggerType}]: regime=${coloredRegime} (conf=${effectivePrediction.regimeConfidence.toFixed(2)}, margin=${effectivePrediction.regimeScoreMargin.toFixed(2)}) | pUp=${effectivePrediction.pUp.toFixed(3)} | Edge=${(bestEdge * 100).toFixed(1)}% | Dir: ${effectivePrediction.direction.toUpperCase()} | Signal: ${coloredSignal}${blockedText} | Pred: ${effectivePrediction.predictedPrice.toFixed(4)} (cur: ${upAsk.toFixed(4)})`);
 
             // Execute prediction-based trading strategy
             this.executePredictionTrade(market, slug, effectivePrediction, upAsk, downAsk, currentTokenIds, shareSize, regimeExec);
@@ -956,6 +1117,7 @@ export class UpDownPredictionBot {
             this.reversalArmPending.delete(market);
             this.return1History.delete(market);
             this.reversalPrevExhaustionZ.delete(market);
+            this.regimeStateByMarket.delete(market);
 
             logger.info(`✅ Market ${market} re-initialized with new token IDs for cycle ${newSlug}`);
         } catch (e) {
@@ -1007,8 +1169,9 @@ export class UpDownPredictionBot {
 
     /**
      * Execute prediction-based trading strategy
-     * When prediction says UP → buy UP token, then at next prediction buy DOWN token
-     * When prediction says DOWN → buy DOWN token, then at next prediction buy UP token
+     * Single-leg execution only:
+     * - buy UP when direction is up
+     * - buy DOWN when direction is down
      * `shareSize` defaults to config; regime strategies may scale size.
      */
     private executePredictionTrade(
@@ -1126,22 +1289,6 @@ export class UpDownPredictionBot {
             size,
         );
 
-        // Place second-side limit order IMMEDIATELY (within 50ms) without waiting for first order response.
-        // Pass the actual opposite-side ask so the limit price reflects real market conditions.
-        const oppositeAsk = buyToken === "UP" ? downAsk : upAsk;
-
-        this.placeSecondSideLimitOrder(
-            buyToken,
-            buyPrice,
-            oppositeAsk,
-            tokenIds,
-            market,
-            slug,
-            scoreKey,
-            tokenCounts,
-            size,
-        );
-
         if (regimeExec?.kind === "flow_dominance") {
             this.flowDominanceHold.set(market, {
                 entryTick: regimeExec.processTick,
@@ -1189,182 +1336,6 @@ export class UpDownPredictionBot {
         if (tokenCounts.upTokenCount >= this.MAX_BUY_COUNTS_PER_SIDE && tokenCounts.downTokenCount >= this.MAX_BUY_COUNTS_PER_SIDE) {
             this.pausedMarkets.add(scoreKey);
             logger.info(`⏸️  Market ${scoreKey} PAUSED: Reached limit (UP: ${tokenCounts.upTokenCount}/${this.MAX_BUY_COUNTS_PER_SIDE}, DOWN: ${tokenCounts.downTokenCount}/${this.MAX_BUY_COUNTS_PER_SIDE})`);
-        }
-    }
-
-    /**
-     * Place limit order for second side (opposite token).
-     * Uses the actual opposite-side ask price minus a small discount for fill probability.
-     */
-    private async placeSecondSideLimitOrder(
-        firstSide: "UP" | "DOWN",
-        firstSidePrice: number,
-        oppositeAsk: number,
-        tokenIds: { upTokenId: string; downTokenId: string; conditionId: string; upIdx: number; downIdx: number },
-        market: string,
-        slug: string,
-        scoreKey: string,
-        tokenCounts: { upTokenCount: number; downTokenCount: number },
-        orderSize: number,
-    ): Promise<void> {
-        // Determine opposite side
-        const oppositeSide = firstSide === "UP" ? "DOWN" : "UP";
-        const oppositeTokenId = firstSide === "UP" ? tokenIds.downTokenId : tokenIds.upTokenId;
-
-        // CRITICAL: Check if market is paused FIRST
-        if (this.pausedMarkets.has(scoreKey)) {
-            return;
-        }
-
-        // Use actual opposite-side ask minus a small discount (2 cents) for better fill.
-        // Fallback to (0.98 - firstSidePrice) if opposite ask is unavailable.
-        const LIMIT_DISCOUNT = 0.02;
-        let limitPrice: number;
-        if (oppositeAsk > 0 && oppositeAsk < 1) {
-            limitPrice = oppositeAsk - LIMIT_DISCOUNT;
-        } else {
-            limitPrice = 0.98 - firstSidePrice;
-        }
-
-        // Clamp to valid range and ensure total cost (first + second) stays under 0.98
-        // for built-in profit margin at resolution.
-        const maxSecondPrice = Math.min(0.97, 0.98 - firstSidePrice);
-        limitPrice = Math.min(limitPrice, maxSecondPrice);
-
-        if (limitPrice <= 0.01 || limitPrice >= 0.97) {
-            logger.error(`⚠️  Invalid limit price calculated: ${limitPrice.toFixed(4)} (opposite ask: ${oppositeAsk.toFixed(4)}, first side: ${firstSidePrice.toFixed(4)})`);
-            return;
-        }
-
-        const limitOrder: UserOrder = {
-            tokenID: oppositeTokenId,
-            side: Side.BUY,
-            price: limitPrice,
-            size: orderSize,
-        };
-
-        try {
-            // Place order IMMEDIATELY (await to ensure it's placed within 50ms of first order)
-            const response = await this.client.createAndPostOrder(
-                limitOrder,
-                { tickSize: this.cfg.tickSize, negRisk: this.cfg.negRisk },
-                OrderType.GTC // Good-Till-Cancel for limit orders
-            );
-            
-            const orderID = response?.orderID;
-            // Log second-side limit order placement clearly with limit info
-            const limitCost = limitPrice * orderSize;
-            if (orderID) {
-                logger.info(`📋 SECOND-SIDE Limit Order: ${oppositeSide} @ ${limitPrice.toFixed(4)} (${limitCost.toFixed(2)} USDC) | First-Side: ${firstSide} @ ${firstSidePrice.toFixed(4)} | Current: UP ${tokenCounts.upTokenCount}/${this.MAX_BUY_COUNTS_PER_SIDE}, DOWN ${tokenCounts.downTokenCount}/${this.MAX_BUY_COUNTS_PER_SIDE} | Limit: ${this.MAX_BUY_COUNTS_PER_SIDE} per side | OrderID: ${orderID.substring(0, 10)}...`);
-                // Track second-side limit so fills update score (downTokenCost/upTokenCost and counts)
-                const leg = oppositeSide === "UP" ? "YES" : "NO";
-                this.trackLimitOrderAsync(
-                    orderID,
-                    leg,
-                    oppositeTokenId,
-                    tokenIds.conditionId,
-                    orderSize,
-                    limitPrice,
-                    market,
-                    slug,
-                    tokenIds.upIdx,
-                    tokenIds.downIdx,
-                    scoreKey,
-                    tokenCounts
-                ).catch(() => { /* fire-and-forget */ });
-            } else {
-                logger.error(`⚠️  Second-side limit order placement returned no orderID`);
-            }
-        } catch (e) {
-            logger.error(`❌ Failed to place limit order for ${oppositeSide} token: ${e instanceof Error ? e.message : String(e)}`);
-        }
-    }
-
-    /**
-     * Track limit order asynchronously and update token counts when filled
-     */
-    private async trackLimitOrderAsync(
-        orderID: string,
-        leg: "YES" | "NO",
-        tokenID: string,
-        conditionId: string,
-        estimatedShares: number,
-        limitPrice: number,
-        market: string,
-        slug: string,
-        upIdx: number,
-        downIdx: number,
-        scoreKey: string,
-        tokenCounts: { upTokenCount: number; downTokenCount: number }
-    ): Promise<void> {
-        try {
-            // Optimized polling with exponential backoff
-            let attempts = 0;
-            const maxAttempts = 30; // Reduced from 60 to 30 (30 seconds max)
-            let pollInterval = 500; // Start with 500ms, increase gradually
-            const maxInterval = 3000; // Max 3 seconds between checks
-
-            while (attempts < maxAttempts) {
-                await new Promise(resolve => setTimeout(resolve, pollInterval));
-                attempts++;
-
-                try {
-                    const order = await this.client.getOrder(orderID);
-
-                    if (order && order.status === "FILLED") {
-                        // CRITICAL: Check limit BEFORE incrementing to prevent exceeding limit
-                        // This prevents race conditions where multiple limit orders fill simultaneously
-                        const wouldExceedLimit = (leg === "YES" && tokenCounts.upTokenCount >= this.MAX_BUY_COUNTS_PER_SIDE) ||
-                            (leg === "NO" && tokenCounts.downTokenCount >= this.MAX_BUY_COUNTS_PER_SIDE);
-
-                        if (wouldExceedLimit) {
-                            logger.error(`⚠️  Limit order ${orderID} filled but would exceed limit - cancelling count update (${leg}: ${leg === "YES" ? tokenCounts.upTokenCount : tokenCounts.downTokenCount}/${this.MAX_BUY_COUNTS_PER_SIDE})`);
-                            return; // Don't increment count if it would exceed limit
-                        }
-
-                        // Order filled - update token counts
-                        const fillCost = limitPrice * estimatedShares;
-
-                        if (leg === "YES") {
-                            tokenCounts.upTokenCount++;
-                            const score = this.predictionScores.get(scoreKey);
-                            if (score) {
-                                score.upTokenCost += fillCost;
-                                score.upTokenCount++;
-                            }
-                        } else {
-                            tokenCounts.downTokenCount++;
-                            const score = this.predictionScores.get(scoreKey);
-                            if (score) {
-                                score.downTokenCost += fillCost;
-                                score.downTokenCount++;
-                            }
-                        }
-
-                        logger.info(`✅ Limit order filled: ${leg} @ ${limitPrice.toFixed(4)} | UP ${tokenCounts.upTokenCount}/${this.MAX_BUY_COUNTS_PER_SIDE}, DOWN ${tokenCounts.downTokenCount}/${this.MAX_BUY_COUNTS_PER_SIDE}`);
-
-                        if (tokenCounts.upTokenCount >= this.MAX_BUY_COUNTS_PER_SIDE && tokenCounts.downTokenCount >= this.MAX_BUY_COUNTS_PER_SIDE) {
-                            this.pausedMarkets.add(scoreKey);
-                            logger.info(`⏸️  Market ${scoreKey} PAUSED after limit order fill: UP: ${tokenCounts.upTokenCount}/${this.MAX_BUY_COUNTS_PER_SIDE}, DOWN: ${tokenCounts.downTokenCount}/${this.MAX_BUY_COUNTS_PER_SIDE}`);
-                        }
-
-                        return; // Order filled, stop tracking
-                    } else if (order && (order.status === "CANCELLED" || order.status === "REJECTED")) {
-                        return; // Order cancelled/rejected, stop tracking silently
-                    }
-                } catch (e) {
-                    // Order might not be found yet, continue polling with backoff
-                    // Increase interval gradually (exponential backoff)
-                    if (pollInterval < maxInterval) {
-                        pollInterval = Math.min(pollInterval * 1.5, maxInterval);
-                    }
-                    // Silent polling - no logging to reduce noise
-                }
-            }
-
-            // Silent timeout - limit orders may fill later, no need to log
-        } catch (e) {
-            logger.error(`❌ Error tracking limit order ${orderID}: ${e instanceof Error ? e.message : String(e)}`);
         }
     }
 

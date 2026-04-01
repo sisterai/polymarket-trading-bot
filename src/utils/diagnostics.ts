@@ -119,7 +119,9 @@ export class PredictionDiagnostics {
             timestamp: snapshot.timestamp,
             upAsk: snapshot.bestAsk,
             downAsk: snapshot.downAsk ?? null,
-            spread: Math.max(snapshot.bestAsk - snapshot.bestBid, 0),
+            spread: snapshot.bestBid !== null && snapshot.bestBid !== undefined
+                ? Math.max(snapshot.bestAsk - snapshot.bestBid, 0)
+                : null,
             predictedPrice: prediction.predictedPrice,
             rawScore: prediction.rawScore,
             pUp: prediction.pUp,

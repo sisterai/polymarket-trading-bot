@@ -44,3 +44,99 @@
 2026-04-01T11:20:02.941Z  INFO  🔄 Re-initializing market btc with new slug btc-updown-5m-1775042400 (from periodic check)
 2026-04-01T11:20:02.941Z  ERROR  ⚠️  No prediction score found for btc-btc-updown-5m-1775042100 - cannot generate summary
 2026-04-01T11:20:03.410Z  INFO  ✅ Market btc re-initialized with new token IDs for cycle btc-updown-5m-1775042400
+2026-04-01T11:25:03.143Z  INFO  🔄 Market cycle change detected via periodic check for btc: btc-updown-5m-1775042400 → btc-updown-5m-1775042700
+2026-04-01T11:25:03.143Z  INFO  🔄 Re-initializing market btc with new slug btc-updown-5m-1775042700 (from periodic check)
+2026-04-01T11:25:03.143Z  ERROR  ⚠️  No prediction score found for btc-btc-updown-5m-1775042400 - cannot generate summary
+2026-04-01T11:25:03.943Z  INFO  ✅ Market btc re-initialized with new token IDs for cycle btc-updown-5m-1775042700
+2026-04-01T11:30:03.361Z  INFO  🔄 Market cycle change detected via periodic check for btc: btc-updown-5m-1775042700 → btc-updown-5m-1775043000
+2026-04-01T11:30:03.362Z  INFO  🔄 Re-initializing market btc with new slug btc-updown-5m-1775043000 (from periodic check)
+2026-04-01T11:30:03.362Z  ERROR  ⚠️  No prediction score found for btc-btc-updown-5m-1775042700 - cannot generate summary
+2026-04-01T11:30:03.871Z  INFO  ✅ Market btc re-initialized with new token IDs for cycle btc-updown-5m-1775043000
+2026-04-01T11:35:03.548Z  INFO  🔄 Market cycle change detected via periodic check for btc: btc-updown-5m-1775043000 → btc-updown-5m-1775043300
+2026-04-01T11:35:03.548Z  INFO  🔄 Re-initializing market btc with new slug btc-updown-5m-1775043300 (from periodic check)
+2026-04-01T11:35:03.548Z  ERROR  ⚠️  No prediction score found for btc-btc-updown-5m-1775043000 - cannot generate summary
+2026-04-01T11:35:04.503Z  INFO  ✅ Market btc re-initialized with new token IDs for cycle btc-updown-5m-1775043300
+2026-04-01T11:40:03.818Z  INFO  🔄 Market cycle change detected via periodic check for btc: btc-updown-5m-1775043300 → btc-updown-5m-1775043600
+2026-04-01T11:40:03.818Z  INFO  🔄 Re-initializing market btc with new slug btc-updown-5m-1775043600 (from periodic check)
+2026-04-01T11:40:03.819Z  ERROR  ⚠️  No prediction score found for btc-btc-updown-5m-1775043300 - cannot generate summary
+2026-04-01T11:40:13.836Z  INFO  🔄 Market cycle change detected via periodic check for btc: btc-updown-5m-1775043300 → btc-updown-5m-1775043600
+2026-04-01T11:40:13.837Z  INFO  🔄 Re-initializing market btc with new slug btc-updown-5m-1775043600 (from periodic check)
+2026-04-01T11:40:13.837Z  ERROR  ⚠️  No prediction score found for btc-btc-updown-5m-1775043300 - cannot generate summary
+2026-04-01T11:40:13.839Z  ERROR  ⚠️  Failed to re-initialize market btc with new slug btc-updown-5m-1775043600: fetch failed. Will retry on next check.
+2026-04-01T11:40:15.865Z  ERROR  ⚠️  Failed to re-initialize market btc with new slug btc-updown-5m-1775043600: fetch failed. Will retry on next check.
+2026-04-01T11:40:23.846Z  INFO  🔄 Market cycle change detected via periodic check for btc: btc-updown-5m-1775043300 → btc-updown-5m-1775043600
+2026-04-01T11:40:23.851Z  INFO  🔄 Re-initializing market btc with new slug btc-updown-5m-1775043600 (from periodic check)
+2026-04-01T11:40:23.851Z  ERROR  ⚠️  No prediction score found for btc-btc-updown-5m-1775043300 - cannot generate summary
+2026-04-01T11:40:24.754Z  INFO  ✅ Market btc re-initialized with new token IDs for cycle btc-updown-5m-1775043600
+2026-04-01T11:45:03.980Z  INFO  🔄 Market cycle change detected via periodic check for btc: btc-updown-5m-1775043600 → btc-updown-5m-1775043900
+2026-04-01T11:45:03.981Z  INFO  🔄 Re-initializing market btc with new slug btc-updown-5m-1775043900 (from periodic check)
+2026-04-01T11:45:03.981Z  ERROR  ⚠️  No prediction score found for btc-btc-updown-5m-1775043600 - cannot generate summary
+2026-04-01T11:45:04.807Z  INFO  ✅ Market btc re-initialized with new token IDs for cycle btc-updown-5m-1775043900
+2026-04-01T11:50:04.009Z  INFO  🔄 Market cycle change detected via periodic check for btc: btc-updown-5m-1775043900 → btc-updown-5m-1775044200
+2026-04-01T11:50:04.009Z  INFO  🔄 Re-initializing market btc with new slug btc-updown-5m-1775044200 (from periodic check)
+2026-04-01T11:50:04.009Z  ERROR  ⚠️  No prediction score found for btc-btc-updown-5m-1775043900 - cannot generate summary
+2026-04-01T11:50:04.820Z  INFO  ✅ Market btc re-initialized with new token IDs for cycle btc-updown-5m-1775044200
+2026-04-01T11:55:04.029Z  INFO  🔄 Market cycle change detected via periodic check for btc: btc-updown-5m-1775044200 → btc-updown-5m-1775044500
+2026-04-01T11:55:04.030Z  INFO  🔄 Re-initializing market btc with new slug btc-updown-5m-1775044500 (from periodic check)
+2026-04-01T11:55:04.030Z  ERROR  ⚠️  No prediction score found for btc-btc-updown-5m-1775044200 - cannot generate summary
+2026-04-01T11:55:04.866Z  INFO  ✅ Market btc re-initialized with new token IDs for cycle btc-updown-5m-1775044500
+2026-04-01T12:00:04.048Z  INFO  🔄 Market cycle change detected via periodic check for btc: btc-updown-5m-1775044500 → btc-updown-5m-1775044800
+2026-04-01T12:00:04.048Z  INFO  🔄 Re-initializing market btc with new slug btc-updown-5m-1775044800 (from periodic check)
+2026-04-01T12:00:04.048Z  ERROR  ⚠️  No prediction score found for btc-btc-updown-5m-1775044500 - cannot generate summary
+2026-04-01T12:00:14.051Z  INFO  🔄 Market cycle change detected via periodic check for btc: btc-updown-5m-1775044500 → btc-updown-5m-1775044800
+2026-04-01T12:00:14.051Z  INFO  🔄 Re-initializing market btc with new slug btc-updown-5m-1775044800 (from periodic check)
+2026-04-01T12:00:14.051Z  ERROR  ⚠️  No prediction score found for btc-btc-updown-5m-1775044500 - cannot generate summary
+2026-04-01T12:00:14.053Z  ERROR  ⚠️  Failed to re-initialize market btc with new slug btc-updown-5m-1775044800: fetch failed. Will retry on next check.
+2026-04-01T12:00:16.052Z  ERROR  ⚠️  Failed to re-initialize market btc with new slug btc-updown-5m-1775044800: fetch failed. Will retry on next check.
+2026-04-01T12:00:24.053Z  INFO  🔄 Market cycle change detected via periodic check for btc: btc-updown-5m-1775044500 → btc-updown-5m-1775044800
+2026-04-01T12:00:24.053Z  INFO  🔄 Re-initializing market btc with new slug btc-updown-5m-1775044800 (from periodic check)
+2026-04-01T12:00:24.053Z  ERROR  ⚠️  No prediction score found for btc-btc-updown-5m-1775044500 - cannot generate summary
+2026-04-01T12:00:24.790Z  INFO  ✅ Market btc re-initialized with new token IDs for cycle btc-updown-5m-1775044800
+2026-04-01T12:05:04.067Z  INFO  🔄 Market cycle change detected via periodic check for btc: btc-updown-5m-1775044800 → btc-updown-5m-1775045100
+2026-04-01T12:05:04.067Z  INFO  🔄 Re-initializing market btc with new slug btc-updown-5m-1775045100 (from periodic check)
+2026-04-01T12:05:04.067Z  ERROR  ⚠️  No prediction score found for btc-btc-updown-5m-1775044800 - cannot generate summary
+2026-04-01T12:05:04.978Z  INFO  ✅ Market btc re-initialized with new token IDs for cycle btc-updown-5m-1775045100
+2026-04-01T12:10:04.083Z  INFO  🔄 Market cycle change detected via periodic check for btc: btc-updown-5m-1775045100 → btc-updown-5m-1775045400
+2026-04-01T12:10:04.084Z  INFO  🔄 Re-initializing market btc with new slug btc-updown-5m-1775045400 (from periodic check)
+2026-04-01T12:10:04.084Z  ERROR  ⚠️  No prediction score found for btc-btc-updown-5m-1775045100 - cannot generate summary
+2026-04-01T12:10:05.064Z  INFO  ✅ Market btc re-initialized with new token IDs for cycle btc-updown-5m-1775045400
+2026-04-01T12:15:04.097Z  INFO  🔄 Market cycle change detected via periodic check for btc: btc-updown-5m-1775045400 → btc-updown-5m-1775045700
+2026-04-01T12:15:04.097Z  INFO  🔄 Re-initializing market btc with new slug btc-updown-5m-1775045700 (from periodic check)
+2026-04-01T12:15:04.098Z  ERROR  ⚠️  No prediction score found for btc-btc-updown-5m-1775045400 - cannot generate summary
+2026-04-01T12:15:04.827Z  INFO  ✅ Market btc re-initialized with new token IDs for cycle btc-updown-5m-1775045700
+2026-04-01T12:20:04.113Z  INFO  🔄 Market cycle change detected via periodic check for btc: btc-updown-5m-1775045700 → btc-updown-5m-1775046000
+2026-04-01T12:20:04.114Z  INFO  🔄 Re-initializing market btc with new slug btc-updown-5m-1775046000 (from periodic check)
+2026-04-01T12:20:04.114Z  ERROR  ⚠️  No prediction score found for btc-btc-updown-5m-1775045700 - cannot generate summary
+2026-04-01T12:20:04.902Z  INFO  ✅ Market btc re-initialized with new token IDs for cycle btc-updown-5m-1775046000
+2026-04-01T12:25:04.126Z  INFO  🔄 Market cycle change detected via periodic check for btc: btc-updown-5m-1775046000 → btc-updown-5m-1775046300
+2026-04-01T12:25:04.126Z  INFO  🔄 Re-initializing market btc with new slug btc-updown-5m-1775046300 (from periodic check)
+2026-04-01T12:25:04.126Z  ERROR  ⚠️  No prediction score found for btc-btc-updown-5m-1775046000 - cannot generate summary
+2026-04-01T12:25:05.165Z  INFO  ✅ Market btc re-initialized with new token IDs for cycle btc-updown-5m-1775046300
+2026-04-01T12:30:04.142Z  INFO  🔄 Market cycle change detected via periodic check for btc: btc-updown-5m-1775046300 → btc-updown-5m-1775046600
+2026-04-01T12:30:04.142Z  INFO  🔄 Re-initializing market btc with new slug btc-updown-5m-1775046600 (from periodic check)
+2026-04-01T12:30:04.142Z  ERROR  ⚠️  No prediction score found for btc-btc-updown-5m-1775046300 - cannot generate summary
+2026-04-01T12:30:05.589Z  INFO  ✅ Market btc re-initialized with new token IDs for cycle btc-updown-5m-1775046600
+2026-04-01T12:35:04.159Z  INFO  🔄 Market cycle change detected via periodic check for btc: btc-updown-5m-1775046600 → btc-updown-5m-1775046900
+2026-04-01T12:35:04.159Z  INFO  🔄 Re-initializing market btc with new slug btc-updown-5m-1775046900 (from periodic check)
+2026-04-01T12:35:04.159Z  ERROR  ⚠️  No prediction score found for btc-btc-updown-5m-1775046600 - cannot generate summary
+2026-04-01T12:35:04.919Z  INFO  ✅ Market btc re-initialized with new token IDs for cycle btc-updown-5m-1775046900
+2026-04-01T12:40:04.415Z  INFO  🔄 Market cycle change detected via periodic check for btc: btc-updown-5m-1775046900 → btc-updown-5m-1775047200
+2026-04-01T12:40:04.415Z  INFO  🔄 Re-initializing market btc with new slug btc-updown-5m-1775047200 (from periodic check)
+2026-04-01T12:40:04.415Z  ERROR  ⚠️  No prediction score found for btc-btc-updown-5m-1775046900 - cannot generate summary
+2026-04-01T12:40:05.210Z  INFO  ✅ Market btc re-initialized with new token IDs for cycle btc-updown-5m-1775047200
+2026-04-01T12:45:04.632Z  INFO  🔄 Market cycle change detected via periodic check for btc: btc-updown-5m-1775047200 → btc-updown-5m-1775047500
+2026-04-01T12:45:04.632Z  INFO  🔄 Re-initializing market btc with new slug btc-updown-5m-1775047500 (from periodic check)
+2026-04-01T12:45:04.632Z  ERROR  ⚠️  No prediction score found for btc-btc-updown-5m-1775047200 - cannot generate summary
+2026-04-01T12:45:05.377Z  INFO  ✅ Market btc re-initialized with new token IDs for cycle btc-updown-5m-1775047500
+2026-04-01T12:50:04.874Z  INFO  🔄 Market cycle change detected via periodic check for btc: btc-updown-5m-1775047500 → btc-updown-5m-1775047800
+2026-04-01T12:50:04.874Z  INFO  🔄 Re-initializing market btc with new slug btc-updown-5m-1775047800 (from periodic check)
+2026-04-01T12:50:04.874Z  ERROR  ⚠️  No prediction score found for btc-btc-updown-5m-1775047500 - cannot generate summary
+2026-04-01T12:50:07.527Z  INFO  ✅ Market btc re-initialized with new token IDs for cycle btc-updown-5m-1775047800
+2026-04-01T12:55:05.124Z  INFO  🔄 Market cycle change detected via periodic check for btc: btc-updown-5m-1775047800 → btc-updown-5m-1775048100
+2026-04-01T12:55:05.124Z  INFO  🔄 Re-initializing market btc with new slug btc-updown-5m-1775048100 (from periodic check)
+2026-04-01T12:55:05.124Z  ERROR  ⚠️  No prediction score found for btc-btc-updown-5m-1775047800 - cannot generate summary
+2026-04-01T12:55:05.680Z  INFO  ✅ Market btc re-initialized with new token IDs for cycle btc-updown-5m-1775048100
+2026-04-01T13:00:05.346Z  INFO  🔄 Market cycle change detected via periodic check for btc: btc-updown-5m-1775048100 → btc-updown-5m-1775048400
+2026-04-01T13:00:05.346Z  INFO  🔄 Re-initializing market btc with new slug btc-updown-5m-1775048400 (from periodic check)
+2026-04-01T13:00:05.346Z  ERROR  ⚠️  No prediction score found for btc-btc-updown-5m-1775048100 - cannot generate summary
+2026-04-01T13:00:06.348Z  INFO  ✅ Market btc re-initialized with new token IDs for cycle btc-updown-5m-1775048400
