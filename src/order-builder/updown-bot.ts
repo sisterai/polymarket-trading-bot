@@ -273,6 +273,12 @@ export class UpDownPredictionBot {
     constructor(private client: ClobClient, private cfg: SimpleConfig) {
         // Initialize MAX_BUY_COUNTS_PER_SIDE from config
         this.MAX_BUY_COUNTS_PER_SIDE = config.trading.maxBuyCountsPerSide;
+        if (this.MAX_BUY_COUNTS_PER_SIDE === 0) {
+            logger.warning(
+                `⚠️ TRADING_MAX_BUY_COUNTS_PER_SIDE=0 detected: bot will skip all trades due to per-side limit check. ` +
+                `Set TRADING_MAX_BUY_COUNTS_PER_SIDE to a positive integer (e.g., 50) to enable trading.`,
+            );
+        }
         // Initialize WebSocket orderbook (store promise for later awaiting)
         this.initializationPromise = this.initializeWebSocket();
     }
