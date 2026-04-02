@@ -6,6 +6,7 @@ import { logger, colorRegime, colorStrategy, colorSignal } from "../utils/logger
 import { config } from "../config";
 import { WebSocketOrderBook, TokenPrice } from "../providers/websocketOrderbook";
 import { AdaptivePricePredictor, PricePrediction, MarketSnapshot } from "../utils/pricePredictor";
+import { scaleSharesByConfidence } from "../utils/position-sizing";
 import { lowSignalBlocksTrade, formatLowSignalBlockReason, formatChopMicroMetrics } from "../utils/low-signal-gate";
 import {
     executionRiskDanger,
@@ -982,6 +983,18 @@ export class UpDownPredictionBot {
                             `⚠️ EXPIRY-CLOSE: size cap=${shareSize} (flow_dominance=${fd.toFixed(2)}, spread/depth OK)`,
                         );
                     }
+                }
+            }
+
+            // Confidence-weighted size: higher conviction → larger position, lower → smaller.
+            // Runs after strategy-specific sizing and execution-risk / expiry caps.
+            if (effectivePrediction.signal !== "HOLD") {
+                const before = shareSize;
+                shareSize = scaleSharesByConfidence(shareSize, effectivePrediction);
+                if (Math.abs(before - shareSize) > 1e-6) {
+                    logger.debug(
+                        `size ${before.toFixed(3)} → ${shareSize.toFixed(3)} (conf=${effectivePrediction.confidence.toFixed(2)} regimeConf=${effectivePrediction.regimeConfidence.toFixed(2)} margin=${effectivePrediction.regimeScoreMargin.toFixed(2)})`,
+                    );
                 }
             }
 
