@@ -46,52 +46,76 @@ export function computeUpProbability(
 }
 
 /**
- * EWMA volatility tracker (λ = 0.94, RiskMetrics standard).
+ * EWMA volatility tracker calibrated for **sub-second Binance aggTrade data**.
  *
- * Updates on each new price tick, normalises log-returns to a per-second
- * basis so that `getAnnualizedVolatility()` is consistent with the T-in-years
- * convention used in `computeUpProbability`.
+ * Strategy: bucket incoming ticks into 1-second bars, compute one log-return
+ * per completed second, then apply EWMA with λ = 0.98 (≈ 50-second effective
+ * lookback at 1 obs/sec).  This avoids the classic RiskMetrics λ = 0.94 mistake
+ * where that value was designed for *daily* data and gives only ~1.7 s lookback
+ * on tick data.
+ *
+ * `getAnnualizedVolatility()` returns σ in years, consistent with T-in-years
+ * used in `computeUpProbability`.
  */
 export class EWMAVolatility {
-    private readonly lambda = 0.94;
+    /** λ for 1-obs/second data: effective lookback ≈ 1/(1-λ) seconds. */
+    private readonly lambda = 0.98;
+    /** L2 regularisation coefficient – prevents weight collapse under bad streaks. */
+    private readonly l2 = 0.001;
+
     private variancePerSecond = 0;
-    private lastPrice: number | null = null;
-    private lastTimestamp: number | null = null;
     private initialized = false;
 
+    // Second-bar state
+    private currentSecond = -1;
+    private barOpen: number | null = null;
+    private barClose: number | null = null;
+
     update(price: number, timestamp: number): void {
-        if (this.lastPrice === null || this.lastTimestamp === null) {
-            this.lastPrice = price;
-            this.lastTimestamp = timestamp;
+        const sec = Math.floor(timestamp / 1000);
+
+        if (this.currentSecond === -1) {
+            // Very first tick – open first bar
+            this.currentSecond = sec;
+            this.barOpen = price;
+            this.barClose = price;
             return;
         }
 
-        const dt = Math.max(0.01, (timestamp - this.lastTimestamp) / 1000); // seconds
-        const logReturn = Math.log(price / this.lastPrice);
-        // Normalise to per-second variance so annualisation is straightforward
-        const r2PerSec = (logReturn * logReturn) / dt;
-
-        this.variancePerSecond = this.initialized
-            ? this.lambda * this.variancePerSecond + (1 - this.lambda) * r2PerSec
-            : r2PerSec;
-
-        this.initialized = true;
-        this.lastPrice = price;
-        this.lastTimestamp = timestamp;
+        if (sec === this.currentSecond) {
+            // Same second – update close
+            this.barClose = price;
+        } else {
+            // New second – commit the completed bar
+            if (this.barOpen !== null && this.barClose !== null && this.barOpen > 0) {
+                const logRet = Math.log(this.barClose / this.barOpen);
+                const r2 = logRet * logRet;
+                this.variancePerSecond = this.initialized
+                    ? this.lambda * this.variancePerSecond + (1 - this.lambda) * r2
+                    : r2;
+                this.initialized = true;
+            }
+            // Start new bar (may skip empty seconds – that's fine)
+            this.currentSecond = sec;
+            this.barOpen = price;
+            this.barClose = price;
+        }
     }
 
     /** Returns σ in annualised terms (consistent with T in years). */
     getAnnualizedVolatility(): number {
-        // Fallback 80% covers typical crypto volatility before enough data accumulates
-        if (!this.initialized) return 0.8;
-        return Math.sqrt(this.variancePerSecond * SECONDS_PER_YEAR);
+        if (!this.initialized) return 0.8; // conservative fallback until first full second
+        const raw = Math.sqrt(this.variancePerSecond * SECONDS_PER_YEAR);
+        // Apply L2 shrinkage toward 0.8 to damp extreme estimates from thin markets
+        return raw * (1 - this.l2) + 0.8 * this.l2;
     }
 
     reset(): void {
         this.variancePerSecond = 0;
-        this.lastPrice = null;
-        this.lastTimestamp = null;
         this.initialized = false;
+        this.currentSecond = -1;
+        this.barOpen = null;
+        this.barClose = null;
     }
 }
 

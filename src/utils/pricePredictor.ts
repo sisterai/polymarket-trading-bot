@@ -406,14 +406,31 @@ export class AdaptivePricePredictor {
         const actualPrice = this.priceHistory[n - 1];
         const previousPrice = this.priceHistory[n - 2];
         
-        // Get features that were used for previous prediction
+        // Reconstruct the features as they were when the PREVIOUS prediction was made.
+        // Using hardcoded volatility=0.1 / trend=0 (the old code) means weights.volatility and
+        // weights.trend are trained against wrong inputs and diverge over time.
+        const p1 = previousPrice;
+        const p2 = n >= 3 ? this.priceHistory[n - 3] : p1;
+        const p3 = n >= 4 ? this.priceHistory[n - 4] : p2;
+        const prevMomentum = (p1 - p2) / (p2 + 1e-9);
+        // Approximate EMA trend at the previous step using the 3-price span
+        const prevEmaTrend = n >= 4
+            ? ((p1 - p2) * 0.4 + (p2 - p3) * 0.3) / (p2 + 1e-9)
+            : prevMomentum * 0.5;
+        // Approximate volatility as std dev of the 3 most recent prices at that step
+        const prevSlice = this.priceHistory.slice(Math.max(0, n - 4), n - 1);
+        const prevMean = prevSlice.reduce((a, b) => a + b, 0) / (prevSlice.length || 1);
+        const prevVol = prevSlice.length >= 2
+            ? Math.sqrt(prevSlice.reduce((s, v) => s + (v - prevMean) ** 2, 0) / prevSlice.length)
+            : 0.05;
+
         const prevFeatures = {
-            priceLag1: n >= 3 ? this.normalizePrice(this.priceHistory[n - 3]) : 0.5,
-            priceLag2: n >= 4 ? this.normalizePrice(this.priceHistory[n - 4]) : 0.5,
-            priceLag3: n >= 5 ? this.normalizePrice(this.priceHistory[n - 5]) : 0.5,
-            momentum: this.normalizeMomentum((previousPrice - (n >= 3 ? this.priceHistory[n - 3] : previousPrice)) / (previousPrice + 0.0001)),
-            volatility: 0.1, // Simplified
-            trend: 0, // Simplified
+            priceLag1: this.normalizePrice(p2),
+            priceLag2: this.normalizePrice(p3),
+            priceLag3: n >= 5 ? this.normalizePrice(this.priceHistory[n - 5]) : this.normalizePrice(p3),
+            momentum: this.normalizeMomentum(prevMomentum),
+            volatility: this.normalizeVolatility(prevVol),
+            trend: this.normalizeTrend(prevEmaTrend),
         };
         
         const predictedPrice = this.predictPrice(prevFeatures);
@@ -437,16 +454,19 @@ export class AdaptivePricePredictor {
             Math.min(this.maxLearningRate, this.learningRate * (1 + normalizedError * errorMultiplier))
         );
         
-        // Update weights using gradient descent - faster learning from mistakes
-        // More aggressive decay reduction for wrong predictions to learn faster
-        const decay = wasWrong ? 0.85 : 0.97; // Less decay (faster learning) when wrong - even more aggressive (0.88 → 0.85)
-        this.weights.intercept = this.weights.intercept * decay + adaptiveLR * error;
-        this.weights.priceLag1 = this.weights.priceLag1 * decay + adaptiveLR * error * prevFeatures.priceLag1;
-        this.weights.priceLag2 = this.weights.priceLag2 * decay + adaptiveLR * error * prevFeatures.priceLag2;
-        this.weights.priceLag3 = this.weights.priceLag3 * decay + adaptiveLR * error * prevFeatures.priceLag3;
-        this.weights.momentum = this.weights.momentum * decay + adaptiveLR * error * prevFeatures.momentum;
-        this.weights.volatility = this.weights.volatility * decay + adaptiveLR * error * (prevFeatures.volatility || 0.1);
-        this.weights.trend = this.weights.trend * decay + adaptiveLR * error * (prevFeatures.trend || 0);
+        // Update weights using gradient descent with gentle L2 regularisation.
+        // A fixed multiplicative decay (esp. 0.85) collapses weights to zero after only
+        // a handful of wrong predictions and destroys accumulated learning.  L2 at 1e-4
+        // applies a tiny constant pull toward zero each step, which is both stable and
+        // theoretically correct for online SGD.
+        const l2 = wasWrong ? 2e-4 : 1e-4; // slightly stronger regularise when wrong
+        this.weights.intercept = this.weights.intercept * (1 - l2) + adaptiveLR * error;
+        this.weights.priceLag1 = this.weights.priceLag1 * (1 - l2) + adaptiveLR * error * prevFeatures.priceLag1;
+        this.weights.priceLag2 = this.weights.priceLag2 * (1 - l2) + adaptiveLR * error * prevFeatures.priceLag2;
+        this.weights.priceLag3 = this.weights.priceLag3 * (1 - l2) + adaptiveLR * error * prevFeatures.priceLag3;
+        this.weights.momentum = this.weights.momentum * (1 - l2) + adaptiveLR * error * prevFeatures.momentum;
+        this.weights.volatility = this.weights.volatility * (1 - l2) + adaptiveLR * error * prevFeatures.volatility;
+        this.weights.trend = this.weights.trend * (1 - l2) + adaptiveLR * error * prevFeatures.trend;
         
         // Track prediction accuracy (improved logic)
         this.predictionCount++;
@@ -598,19 +618,18 @@ export class AdaptivePricePredictor {
         // CRITICAL: Prevent overconfidence (confidence = 1.00 is often wrong)
         // Cap maximum confidence based on recent accuracy - MUCH more conservative
         if (this.recentPredictions.length >= 10) {
-            const recentAccuracy = this.recentPredictions.filter(p => p.correct).length / this.recentPredictions.length;
-            // Very conservative cap: max confidence = 0.60 + (recentAccuracy * 0.30)
-            // This ensures confidence never exceeds what recent performance justifies
-            const maxConfidence = Math.min(0.92, 0.60 + recentAccuracy * 0.32); // More conservative cap
+            const windowAccuracy = this.recentPredictions.filter(p => p.correct).length / this.recentPredictions.length;
+            // Very conservative cap: max confidence = 0.60 + (windowAccuracy * 0.32)
+            const maxConfidence = Math.min(0.92, 0.60 + windowAccuracy * 0.32);
             confidence = Math.min(maxConfidence, confidence);
             
             // Additional penalty: if recent accuracy is below 60%, cap confidence even lower
-            if (recentAccuracy < 0.55) {
-                confidence = Math.min(0.75, confidence); // Hard cap at 75% if accuracy is very low
-            } else if (recentAccuracy < 0.60) {
-                confidence = Math.min(0.80, confidence); // Hard cap at 80% if accuracy is low
-            } else if (recentAccuracy < 0.65) {
-                confidence = Math.min(0.85, confidence); // Hard cap at 85% if accuracy is moderate
+            if (windowAccuracy < 0.55) {
+                confidence = Math.min(0.75, confidence);
+            } else if (windowAccuracy < 0.60) {
+                confidence = Math.min(0.80, confidence);
+            } else if (windowAccuracy < 0.65) {
+                confidence = Math.min(0.85, confidence);
             }
         } else {
             // Default cap if not enough data - be very conservative early

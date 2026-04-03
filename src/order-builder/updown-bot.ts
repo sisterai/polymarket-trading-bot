@@ -38,7 +38,7 @@ function parseJsonArray<T>(raw: unknown, ctx: string): T[] {
 
 async function fetchTokenIdsForSlug(
     slug: string
-): Promise<{ upTokenId: string; downTokenId: string; conditionId: string; upIdx: number; downIdx: number }> {
+): Promise<{ upTokenId: string; downTokenId: string; conditionId: string; upIdx: number; downIdx: number; strikeK: number | null }> {
     const url = `https://gamma-api.polymarket.com/markets/slug/${slug}`;
     const response = await fetch(url);
     if (!response.ok) {
@@ -55,7 +55,12 @@ async function fetchTokenIdsForSlug(
     if (upIdx < 0 || downIdx < 0) throw new Error(`Missing Up/Down outcomes for slug=${slug}`);
     if (!tokenIds[upIdx] || !tokenIds[downIdx]) throw new Error(`Missing token ids for slug=${slug}`);
 
-    return { upTokenId: tokenIds[upIdx], downTokenId: tokenIds[downIdx], conditionId, upIdx, downIdx };
+    // Parse strike price from question/title, e.g. "Will BTC be above $84,500 at …"
+    const question: string = typeof data.question === "string" ? data.question : (data.title ?? "");
+    const strikeMatch = question.match(/\$([0-9,]+(?:\.[0-9]+)?)/);
+    const strikeK = strikeMatch ? parseFloat(strikeMatch[1].replace(/,/g, "")) : null;
+
+    return { upTokenId: tokenIds[upIdx], downTokenId: tokenIds[downIdx], conditionId, upIdx, downIdx, strikeK };
 }
 
 type SimpleStateRow = {
@@ -94,6 +99,13 @@ const PHASE1_FIRST_LEG_MIN_ASK = 0.5;
 /** Between last 60s and last 30s: if signal ask exceeds this, post leg1 only (no leg2 GTC). */
 const PHASE1_LEG2_SUPPRESS_WINDOW_SEC = 60;
 const PHASE1_LEG2_SUPPRESS_MIN_ASK = 0.7;
+/** Maximum gross USDC spend per 15-minute cycle (0 = unlimited). Override via TRADING_MAX_CYCLE_COST_USDC env var. */
+const MAX_CYCLE_COST_USDC: number = (() => {
+    const raw = (process.env["TRADING_MAX_CYCLE_COST_USDC"] ?? "").trim();
+    if (!raw) return 0;
+    const v = Number(raw);
+    return Number.isFinite(v) && v > 0 ? v : 0;
+})();
 
 function statePath(): string {
     return path.resolve(process.cwd(), STATE_FILE);
@@ -164,7 +176,7 @@ export class UpDownPredictionBot {
     private lastSlugByMarket: Record<string, string> = {};
     private tokenIdsByMarket: Record<
         string,
-        { slug: string; upTokenId: string; downTokenId: string; conditionId: string; upIdx: number; downIdx: number }
+        { slug: string; upTokenId: string; downTokenId: string; conditionId: string; upIdx: number; downIdx: number; strikeK: number | null }
     > = {};
     private state: SimpleStateFile = loadState();
     private isStopped: boolean = false;
@@ -205,6 +217,13 @@ export class UpDownPredictionBot {
     }> = new Map();
 
     private initializationPromise: Promise<void> | null = null;
+    /** Unix-ms timestamp of the last `cancelAll()` call – prevents duplicate calls when
+     *  multiple markets roll over near-simultaneously. */
+    private lastCancelAllMs = 0;
+    /** Interval handles stored so they can be cleared on stop(). */
+    private intervals: NodeJS.Timeout[] = [];
+    /** Per-market lock to prevent concurrent reinitializeMarketForNewCycle calls. */
+    private reinitLocks: Set<string> = new Set();
 
     // Expiry / HPAC state
     private binanceWs: BinanceWebSocket | null = null;
@@ -217,6 +236,11 @@ export class UpDownPredictionBot {
     /** Prior best ask on the single remaining leg (for sudden-drop detection). */
     private hpacRemainingLegPrevAsk: Map<string, number> = new Map();
     private hpacPhaseLocks: Set<string> = new Set();
+    /**
+     * Tracks which (scoreKey → Set<direction>) have already fired a suppressed-leg1-only
+     * trade in the 30–60 s window.  Prevents the same direction being stacked repeatedly.
+     */
+    private suppressedLeg1Fired: Map<string, Set<"UP" | "DOWN">> = new Map();
 
     constructor(private client: ClobClient, private cfg: SimpleConfig) {
         // Initialize MAX_BUY_COUNTS_PER_SIDE from config
@@ -297,38 +321,39 @@ export class UpDownPredictionBot {
         logger.info(`Starting UpDownPredictionBot for markets: ${this.cfg.markets.join(", ")}`);
         await this.initializeMarkets();
 
-        // Set up periodic summary generation - only at quarter-hour boundaries (0m, 15m, 30m, 45m)
-        // Check every minute to catch quarter-hour boundaries precisely
-        setInterval(() => {
-            const now = new Date();
-            const minutes = now.getMinutes();
-            const seconds = now.getSeconds();
+        this.intervals.push(
+            // Periodic summary generation at quarter-hour boundaries
+            setInterval(() => {
+                const now = new Date();
+                const minutes = now.getMinutes();
+                const seconds = now.getSeconds();
+                if ((minutes === 0 || minutes === 15 || minutes === 30 || minutes === 45) && seconds < 5) {
+                    this.flushPredictionSummaries();
+                }
+            }, 60 * 1000),
 
-            // Only generate summaries at quarter-hour boundaries (0m, 15m, 30m, 45m)
-            // Check within the first 5 seconds of the minute to avoid duplicates
-            if ((minutes === 0 || minutes === 15 || minutes === 30 || minutes === 45) && seconds < 5) {
-                this.generateAllPredictionSummaries();
-            }
-        }, 60 * 1000); // Check every minute
+            // Periodic market cycle check (every 10 s)
+            setInterval(() => {
+                void this.checkAndHandleMarketCycleChanges();
+            }, 10 * 1000),
 
-        // Set up periodic market cycle check (every 10 seconds to catch quarter-hour boundaries)
-        // This ensures we detect market cycle changes even if there are no price updates
-        setInterval(() => {
-            this.checkAndHandleMarketCycleChanges();
-        }, 10 * 1000); // Check every 10 seconds
-
-        // Periodic HPAC check – fires every 5 s to catch quiet periods in last 30 s
-        setInterval(() => {
-            void this.checkHPACAllMarkets();
-        }, 5 * 1000);
+            // Periodic HPAC check (every 5 s)
+            setInterval(() => {
+                void this.checkHPACAllMarkets();
+            }, 5 * 1000),
+        );
     }
 
     stop(): void {
         this.isStopped = true;
 
-        // Generate summaries for all active markets before stopping
+        // Clear all periodic timers
+        for (const t of this.intervals) clearInterval(t);
+        this.intervals = [];
+
+        // Generate final summaries unconditionally (no time-gate at shutdown)
         logger.info("\n🛑 Generating final prediction summaries...");
-        this.generateAllPredictionSummaries();
+        this.flushPredictionSummaries(true);
 
         if (this.wsOrderBook) {
             this.wsOrderBook.disconnect();
@@ -340,9 +365,7 @@ export class UpDownPredictionBot {
     }
 
     private async initializeMarkets(): Promise<void> {
-        for (const market of this.cfg.markets) {
-            await this.initializeMarket(market);
-        }
+        await Promise.all(this.cfg.markets.map((m) => this.initializeMarket(m)));
     }
 
     private async initializeMarket(market: string): Promise<void> {
@@ -353,13 +376,21 @@ export class UpDownPredictionBot {
             this.tokenIdsByMarket[market] = { slug, ...tokenIds };
             this.lastSlugByMarket[market] = slug;
 
-            // Seed strike price from Binance if available
-            const bSymbol = marketToBinanceSymbol(market);
-            if (bSymbol && this.binanceWs) {
-                const spotPrice = this.binanceWs.getPrice(bSymbol);
-                if (spotPrice && !this.strikePrice.has(market)) {
-                    this.strikePrice.set(market, spotPrice);
-                    logger.info(`⚡ Strike price initialized [${market}]: ${spotPrice}`);
+            // Prefer strike price parsed from the contract title (most accurate K)
+            if (tokenIds.strikeK !== null && !this.strikePrice.has(market)) {
+                this.strikePrice.set(market, tokenIds.strikeK);
+                logger.info(`⚡ Strike price from Gamma contract [${market}]: ${tokenIds.strikeK}`);
+            }
+
+            // Fall back to live Binance spot only when Gamma didn't provide a strike
+            if (!this.strikePrice.has(market)) {
+                const bSymbol = marketToBinanceSymbol(market);
+                if (bSymbol && this.binanceWs) {
+                    const spotPrice = this.binanceWs.getPrice(bSymbol);
+                    if (spotPrice) {
+                        this.strikePrice.set(market, spotPrice);
+                        logger.info(`⚡ Strike price from Binance fallback [${market}]: ${spotPrice}`);
+                    }
                 }
             }
 
@@ -402,7 +433,8 @@ export class UpDownPredictionBot {
         if (!price.bestAsk || !Number.isFinite(price.bestAsk)) return; // Use bestAsk
 
         // Defer heavy processing to prevent blocking WebSocket message loop
-        queueMicrotask(async () => {
+        queueMicrotask(() => {
+          void (async () => {
             // Get slug for current 15m cycle (with caching)
             const slug = this.getSlugForMarket(market);
             if (!slug) {
@@ -571,7 +603,10 @@ export class UpDownPredictionBot {
 
             // Update previous UP ask price (always update for next comparison)
             row.previousUpPrice = upAsk;
-            // State will be saved by debounced saveState automatically
+            saveState(this.state);
+          })().catch((e) => {
+            logger.error(`handlePriceUpdate error [${market}]: ${e instanceof Error ? e.message : String(e)}`);
+          });
         });
     }
 
@@ -601,10 +636,27 @@ export class UpDownPredictionBot {
     }
 
     /**
-     * Re-initialize market for a new cycle
+     * Re-initialize market for a new cycle.
+     * A per-market lock prevents concurrent calls (from handlePriceUpdate AND the
+     * periodic checkAndHandleMarketCycleChanges) running simultaneously.
      */
     private async reinitializeMarketForNewCycle(market: string, prevSlug: string, newSlug: string): Promise<void> {
+        if (this.reinitLocks.has(market)) return;
+        this.reinitLocks.add(market);
         logger.info(`🔄 Re-initializing market ${market} with new slug ${newSlug} (from periodic check)`);
+
+        // Cancel all open GTC orders (resting second-leg limits from the previous cycle) once per
+        // rollover event, even when multiple markets tick simultaneously.
+        const now = Date.now();
+        if (now - this.lastCancelAllMs > 60_000) {
+            this.lastCancelAllMs = now;
+            try {
+                await this.client.cancelAll();
+                logger.info(`🗑️  Cancelled all open GTC orders at cycle boundary`);
+            } catch (e) {
+                logger.error(`cancelAll failed at cycle boundary: ${e instanceof Error ? e.message : String(e)}`);
+            }
+        }
 
         // Generate prediction score summary for previous market
         this.generatePredictionScoreSummary(prevSlug, market);
@@ -639,13 +691,18 @@ export class UpDownPredictionBot {
 
             this.lastSlugByMarket[market] = newSlug;
 
-            // Update strike price for the new cycle
-            const bSymbol = marketToBinanceSymbol(market);
-            if (bSymbol && this.binanceWs) {
-                const spotPrice = this.binanceWs.getPrice(bSymbol);
-                if (spotPrice) {
-                    this.strikePrice.set(market, spotPrice);
-                    logger.info(`⚡ New strike price [${market}] cycle ${newSlug}: ${spotPrice}`);
+            // Prefer strike price from the new contract title; fall back to live Binance spot
+            if (newTokenIds.strikeK !== null) {
+                this.strikePrice.set(market, newTokenIds.strikeK);
+                logger.info(`⚡ New strike price from Gamma [${market}] cycle ${newSlug}: ${newTokenIds.strikeK}`);
+            } else {
+                const bSymbol = marketToBinanceSymbol(market);
+                if (bSymbol && this.binanceWs) {
+                    const spotPrice = this.binanceWs.getPrice(bSymbol);
+                    if (spotPrice) {
+                        this.strikePrice.set(market, spotPrice);
+                        logger.info(`⚡ New strike price from Binance fallback [${market}] cycle ${newSlug}: ${spotPrice}`);
+                    }
                 }
             }
 
@@ -656,6 +713,7 @@ export class UpDownPredictionBot {
             this.hpacLiquidatedCheapUp.delete(prevHpacKey);
             this.hpacLiquidatedCheapDown.delete(prevHpacKey);
             this.hpacRemainingLegPrevAsk.delete(prevHpacKey);
+            this.suppressedLeg1Fired.delete(prevHpacKey);
 
             const predictor = this.pricePredictors.get(market);
             if (predictor) {
@@ -666,6 +724,8 @@ export class UpDownPredictionBot {
         } catch (e) {
             const errorMsg = e instanceof Error ? e.message : String(e);
             logger.error(`⚠️  Failed to re-initialize market ${market} with new slug ${newSlug}: ${errorMsg}. Will retry on next check.`);
+        } finally {
+            this.reinitLocks.delete(market);
         }
     }
 
@@ -823,7 +883,6 @@ export class UpDownPredictionBot {
         }
 
         // Check if we've reached the limit for this side BEFORE placing order
-        // Use > instead of >= to prevent exceeding limit (if count is already at limit, don't place order)
         if (buyToken === "UP" && tokenCounts.upTokenCount >= this.MAX_BUY_COUNTS_PER_SIDE) {
             logger.info(`⛔ LIMIT REACHED: UP count is ${tokenCounts.upTokenCount}/${this.MAX_BUY_COUNTS_PER_SIDE} - skipping trade`);
             score.totalPredictions--;
@@ -835,7 +894,48 @@ export class UpDownPredictionBot {
             return;
         }
 
-        // Increment count for the side we're buying ONLY (before calling buySharesWithRetry to prevent race conditions)
+        // Imbalance gate: if one side is already ≥ 2 ahead, only allow orders that reduce the gap
+        const { upN: cycleUpN, downN: cycleDownN } = this.getInventoryCounts(scoreKey);
+        if (Math.abs(cycleUpN - cycleDownN) >= 2) {
+            if (buyToken === "UP" && cycleUpN >= cycleDownN) {
+                logger.info(`⏭️  Phase1 skip: UP imbalance (UP=${cycleUpN} DOWN=${cycleDownN})`);
+                score.totalPredictions--;
+                return;
+            }
+            if (buyToken === "DOWN" && cycleDownN >= cycleUpN) {
+                logger.info(`⏭️  Phase1 skip: DOWN imbalance (UP=${cycleUpN} DOWN=${cycleDownN})`);
+                score.totalPredictions--;
+                return;
+            }
+        }
+
+        // Per-cycle gross exposure cap (prevents runaway spending in a single 15m window)
+        const buyCost = buyPrice * this.cfg.sharesPerSide;
+        const totalCycleCost = score.upTokenCost + score.downTokenCost;
+        if (MAX_CYCLE_COST_USDC > 0 && totalCycleCost + buyCost > MAX_CYCLE_COST_USDC) {
+            logger.info(
+                `⛔ CYCLE CAP: would reach ${(totalCycleCost + buyCost).toFixed(2)} USDC ` +
+                `(cap ${MAX_CYCLE_COST_USDC}) – skip`
+            );
+            score.totalPredictions--;
+            return;
+        }
+
+        // In the suppress window: each direction may fire at most once (prevents stacking leg1s)
+        if (suppressLeg2) {
+            if (!this.suppressedLeg1Fired.has(scoreKey)) {
+                this.suppressedLeg1Fired.set(scoreKey, new Set());
+            }
+            const fired = this.suppressedLeg1Fired.get(scoreKey)!;
+            if (fired.has(buyToken)) {
+                logger.info(`⏭️  Phase1 skip: leg1-only ${buyToken} already fired in suppress window`);
+                score.totalPredictions--;
+                return;
+            }
+            fired.add(buyToken);
+        }
+
+        // Increment count for the side we're buying BEFORE the async call to prevent race conditions
         if (buyToken === "UP") {
             tokenCounts.upTokenCount++;
             score.upTokenCount++;
@@ -844,8 +944,6 @@ export class UpDownPredictionBot {
             score.downTokenCount++;
         }
 
-        // Execute the buy
-        const buyCost = buyPrice * this.cfg.sharesPerSide;
         logger.info(
             `🎯 PHASE1 ${suppressLeg2 ? "leg1 only" : "passive pair"}: ${buyToken} leg1 GTC @ bid ${buyPrice.toFixed(4)} ` +
             `(ask ${signalAsk.toFixed(4)}) T≈${timeRemainingSeconds}s` +
@@ -857,12 +955,20 @@ export class UpDownPredictionBot {
         );
 
         if (suppressLeg2) {
+            // Rollback count if the order is rejected
             void this.buyShares(
                 buyToken === "UP" ? "YES" : "NO",
                 tokenId,
                 buyPrice,
                 this.cfg.sharesPerSide,
-            ).catch((e) => {
+            ).then((ok) => {
+                if (!ok) {
+                    if (buyToken === "UP") { tokenCounts!.upTokenCount--; score.upTokenCount--; }
+                    else { tokenCounts!.downTokenCount--; score.downTokenCount--; }
+                    score.trades.pop();
+                    score.totalPredictions--;
+                }
+            }).catch((e) => {
                 logger.error(`Phase1 leg1-only post failed: ${e instanceof Error ? e.message : String(e)}`);
             });
         } else {
@@ -880,6 +986,7 @@ export class UpDownPredictionBot {
                 return;
             }
 
+            // Rollback first-leg count on rejection; second leg tracks its own count on fill
             void Promise.all([
                 this.buyShares(
                     buyToken === "UP" ? "YES" : "NO",
@@ -896,7 +1003,14 @@ export class UpDownPredictionBot {
                     scoreKey,
                     tokenCounts
                 ),
-            ]).catch((e) => {
+            ]).then(([leg1Ok]) => {
+                if (!leg1Ok) {
+                    if (buyToken === "UP") { tokenCounts!.upTokenCount--; score.upTokenCount--; }
+                    else { tokenCounts!.downTokenCount--; score.downTokenCount--; }
+                    score.trades.pop();
+                    score.totalPredictions--;
+                }
+            }).catch((e) => {
                 logger.error(`Phase1 pair post failed: ${e instanceof Error ? e.message : String(e)}`);
             });
         }
@@ -916,7 +1030,7 @@ export class UpDownPredictionBot {
             buyPrice,
             buyCost,
             timestamp: Date.now(),
-            wasCorrect: null, // Will be evaluated at next prediction
+            wasCorrect: null,
         });
 
         // Check if we've reached the limit (max UP + max DOWN)
@@ -947,12 +1061,23 @@ export class UpDownPredictionBot {
             return; // Market is paused, don't place limit orders
         }
 
-        // Calculate limit price: (0.99 - firstSidePrice)
+        // Calculate limit price: (0.98 - firstSidePrice)
         const limitPrice = 0.98 - firstSidePrice;
 
         // Ensure limit price is valid (between 0 and 1)
         if (limitPrice <= 0 || limitPrice >= 1) {
             logger.error(`⚠️  Invalid limit price calculated: ${limitPrice.toFixed(4)} (from first side price ${firstSidePrice.toFixed(4)})`);
+            return;
+        }
+
+        // Sanity: if the second-leg limit is more than 8¢ below the current ask, the order
+        // is very unlikely to fill within the remaining cycle time – skip to avoid leaving
+        // unmatched stale GTC orders that distort inventory accounting.
+        const opposingAsk = this.wsOrderBook?.getPrice(oppositeTokenId)?.bestAsk;
+        if (opposingAsk && Number.isFinite(opposingAsk) && limitPrice < opposingAsk - 0.08) {
+            logger.info(
+                `⏭️  Leg2 skip: limit ${limitPrice.toFixed(4)} is >8¢ below ${oppositeSide} ask ${opposingAsk.toFixed(4)}`
+            );
             return;
         }
 
@@ -1430,24 +1555,17 @@ export class UpDownPredictionBot {
     }
 
     /**
-     * Generate prediction score summaries for all active markets
-     * Called on shutdown or periodically
+     * Flush prediction summaries for all active markets.
+     * @param force - when true (shutdown path), ignore the quarter-hour time gate.
      */
-    private generateAllPredictionSummaries(): void {
-        const now = new Date();
-        const minutes = now.getMinutes();
-
-        // Only generate summaries at quarter-hour boundaries (0m, 15m, 30m, 45m)
-        if (minutes !== 0 && minutes !== 15 && minutes !== 30 && minutes !== 45) {
-            return; // Not at a quarter-hour boundary, skip
+    private flushPredictionSummaries(force = false): void {
+        if (!force) {
+            const minutes = new Date().getMinutes();
+            if (minutes !== 0 && minutes !== 15 && minutes !== 30 && minutes !== 45) return;
         }
 
-        // Generate summary for each active market/slug
-        const scores = Array.from(this.predictionScores.entries());
-        for (const [scoreKey, score] of scores) {
+        for (const score of this.predictionScores.values()) {
             if (score.endTime === null && score.totalPredictions > 0) {
-                // Market is still active and has predictions, generate summary now
-                // Use stored market and slug from score object
                 this.generatePredictionScoreSummary(score.slug, score.market);
             }
         }
