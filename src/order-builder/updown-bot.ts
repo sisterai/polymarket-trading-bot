@@ -5,6 +5,15 @@ import { logger } from "../utils/logger";
 import { config } from "../config";
 import { WebSocketOrderBook, TokenPrice } from "../providers/websocketOrderbook";
 import { AdaptivePricePredictor, PricePrediction } from "../utils/pricePredictor";
+import { BinanceWebSocket, marketToBinanceSymbol } from "../providers/binanceWebSocket";
+import {
+    EWMAVolatility,
+    computeUpProbability,
+    detectSuddenAskDrop,
+    EXPIRY_CHEAP_LEG_ASK_THRESHOLD,
+    EXPIRY_REMAINING_HOLD_MIN_BS_PROB,
+    remainingLegBlackScholesSellOrHold,
+} from "./strategies/expiryStrategy";
 // Helper functions for market slug and token IDs
 function slugForCurrent15m(market: string): string {
     const now = new Date();
@@ -75,6 +84,17 @@ type SimpleConfig = {
 
 const STATE_FILE = "src/data/bot-state.json";
 
+// Expiry strategy constants
+const HPAC_WINDOW_SECONDS = 30;      // switch to HPAC in last N seconds
+const HPAC_EDGE_THRESHOLD = 0.05;    // minimum P(UP) - mktPrice edge to buy
+const FEES_BUFFER = 0.016;           // 1.6% fee reserve
+const MARKET_DURATION_SECONDS = 900; // 15-minute markets
+/** Phase 1 first leg only when this side's best ask is above 50¢ (implied prob > 50%). */
+const PHASE1_FIRST_LEG_MIN_ASK = 0.5;
+/** Between last 60s and last 30s: if signal ask exceeds this, post leg1 only (no leg2 GTC). */
+const PHASE1_LEG2_SUPPRESS_WINDOW_SEC = 60;
+const PHASE1_LEG2_SUPPRESS_MIN_ASK = 0.7;
+
 function statePath(): string {
     return path.resolve(process.cwd(), STATE_FILE);
 }
@@ -84,6 +104,12 @@ function emptyRow(): SimpleStateRow {
         previousUpPrice: null,
         lastUpdatedIso: new Date().toISOString(),
     };
+}
+
+function floorPriceToTick(price: number, tickSize: string): number {
+    const tick = parseFloat(tickSize);
+    if (!Number.isFinite(tick) || tick <= 0) return price;
+    return Math.floor(price / tick) * tick;
 }
 
 function loadState(): SimpleStateFile {
@@ -180,6 +206,18 @@ export class UpDownPredictionBot {
 
     private initializationPromise: Promise<void> | null = null;
 
+    // Expiry / HPAC state
+    private binanceWs: BinanceWebSocket | null = null;
+    private strikePrice: Map<string, number> = new Map();       // market → K at cycle start
+    private ewmaVolatility: Map<string, EWMAVolatility> = new Map();
+    private hpacBoughtUp: Set<string> = new Set();              // scoreKeys where HPAC fired BUY UP
+    private hpacHedged: Set<string> = new Set();                // scoreKeys where HPAC fired HEDGE DOWN
+    private hpacLiquidatedCheapUp: Set<string> = new Set();     // cheap-leg FOK sell UP done for scoreKey
+    private hpacLiquidatedCheapDown: Set<string> = new Set();   // cheap-leg FOK sell DOWN done for scoreKey
+    /** Prior best ask on the single remaining leg (for sudden-drop detection). */
+    private hpacRemainingLegPrevAsk: Map<string, number> = new Map();
+    private hpacPhaseLocks: Set<string> = new Set();
+
     constructor(private client: ClobClient, private cfg: SimpleConfig) {
         // Initialize MAX_BUY_COUNTS_PER_SIDE from config
         this.MAX_BUY_COUNTS_PER_SIDE = config.trading.maxBuyCountsPerSide;
@@ -196,7 +234,37 @@ export class UpDownPredictionBot {
             markets, sharesPerSide, tickSize: tickSize as CreateOrderOptions["tickSize"],
             negRisk, priceBuffer, fireAndForget, minBalanceUsdc,
         });
-        await bot.initializationPromise; // Await WebSocket initialization
+        await bot.initializationPromise; // Await Polymarket WebSocket initialization
+
+        // Connect Binance WebSocket for underlying spot prices (HPAC phase)
+        const binanceWs = new BinanceWebSocket(bot.cfg.markets);
+        try {
+            await binanceWs.connect();
+            bot.binanceWs = binanceWs;
+
+            for (const market of bot.cfg.markets) {
+                const symbol = marketToBinanceSymbol(market);
+                if (!symbol) continue;
+
+                const ewma = new EWMAVolatility();
+                bot.ewmaVolatility.set(market, ewma);
+
+                binanceWs.onPriceUpdate(symbol, (price) => {
+                    ewma.update(price, Date.now());
+                    // Capture the first tick as strike price for this cycle
+                    if (!bot.strikePrice.has(market)) {
+                        bot.strikePrice.set(market, price);
+                        logger.info(`⚡ Strike price set [${market}]: ${price}`);
+                    }
+                });
+            }
+            logger.info("BinanceWebSocket ready – HPAC strategy enabled");
+        } catch (e) {
+            logger.error(
+                `BinanceWebSocket failed (HPAC disabled): ${e instanceof Error ? e.message : String(e)}`
+            );
+        }
+
         return bot;
     }
 
@@ -248,6 +316,11 @@ export class UpDownPredictionBot {
         setInterval(() => {
             this.checkAndHandleMarketCycleChanges();
         }, 10 * 1000); // Check every 10 seconds
+
+        // Periodic HPAC check – fires every 5 s to catch quiet periods in last 30 s
+        setInterval(() => {
+            void this.checkHPACAllMarkets();
+        }, 5 * 1000);
     }
 
     stop(): void {
@@ -259,6 +332,9 @@ export class UpDownPredictionBot {
 
         if (this.wsOrderBook) {
             this.wsOrderBook.disconnect();
+        }
+        if (this.binanceWs) {
+            this.binanceWs.disconnect();
         }
         logger.info("UpDownPredictionBot stopped");
     }
@@ -276,6 +352,16 @@ export class UpDownPredictionBot {
             const tokenIds = await fetchTokenIdsForSlug(slug);
             this.tokenIdsByMarket[market] = { slug, ...tokenIds };
             this.lastSlugByMarket[market] = slug;
+
+            // Seed strike price from Binance if available
+            const bSymbol = marketToBinanceSymbol(market);
+            if (bSymbol && this.binanceWs) {
+                const spotPrice = this.binanceWs.getPrice(bSymbol);
+                if (spotPrice && !this.strikePrice.has(market)) {
+                    this.strikePrice.set(market, spotPrice);
+                    logger.info(`⚡ Strike price initialized [${market}]: ${spotPrice}`);
+                }
+            }
 
             // Subscribe to WebSocket prices for these tokens
             if (this.wsOrderBook) {
@@ -346,6 +432,8 @@ export class UpDownPredictionBot {
 
             let upAsk = upPrice.bestAsk;
             let downAsk = downPrice.bestAsk;
+            let upBid = upPrice.bestBid;
+            let downBid = downPrice.bestBid;
 
             // Debounce: Only process if ask price changed significantly (avoid processing every tick)
             const lastPrice = this.lastProcessedPrice.get(market);
@@ -385,6 +473,8 @@ export class UpDownPredictionBot {
                 }
                 upAsk = newUpPrice.bestAsk;
                 downAsk = newDownPrice.bestAsk;
+                upBid = newUpPrice.bestBid;
+                downBid = newDownPrice.bestBid;
             }
 
             // Update metadata (only if we're going to process)
@@ -394,6 +484,24 @@ export class UpDownPredictionBot {
             row.upIdx = currentTokenIds.upIdx;
             row.downIdx = currentTokenIds.downIdx;
             row.lastUpdatedIso = new Date().toISOString();
+
+            // Phase 2 (HPAC): last 30 seconds – bypass AVMR predictor entirely
+            const timeRemaining = this.getTimeRemainingForSlug(slug);
+            if (timeRemaining > 0 && timeRemaining <= HPAC_WINDOW_SECONDS) {
+                void this.executeHPACPhase(
+                    market, slug, upAsk, downAsk, currentTokenIds,
+                    `${market}-${slug}`, timeRemaining
+                );
+                return;
+            }
+
+            // Phase 1 passive pair: need both bids for maker-style limit prices
+            if (
+                upBid === null || downBid === null ||
+                !Number.isFinite(upBid) || !Number.isFinite(downBid)
+            ) {
+                return;
+            }
 
             // Get or create price predictor for this market
             let predictor = this.pricePredictors.get(market);
@@ -441,8 +549,12 @@ export class UpDownPredictionBot {
             // Log prediction details (only at pole values)
             logger.info(`🔮 PREDICT [POLE]: ${prediction.predictedPrice.toFixed(4)} (current: ${upAsk.toFixed(4)}) | Direction: ${prediction.direction.toUpperCase()} | Confidence: ${(prediction.confidence * 100).toFixed(1)}% | Signal: ${prediction.signal} | Momentum: ${prediction.features.momentum.toFixed(3)} | Vol: ${prediction.features.volatility.toFixed(3)} | Trend: ${prediction.features.trend.toFixed(3)}`);
 
-            // Execute prediction-based trading strategy
-            this.executePredictionTrade(market, slug, prediction, upAsk, downAsk, currentTokenIds);
+            // Execute prediction-based trading strategy (both legs: GTC limits at bid / complement)
+            const phase1TimeRemaining = this.getTimeRemainingForSlug(slug);
+            this.executePredictionTrade(
+                market, slug, prediction, upAsk, downAsk, upBid, downBid, currentTokenIds,
+                phase1TimeRemaining
+            );
 
             // Log accuracy stats periodically (every 25 predictions, and at milestones)
             const stats = predictor.getAccuracyStats();
@@ -527,6 +639,24 @@ export class UpDownPredictionBot {
 
             this.lastSlugByMarket[market] = newSlug;
 
+            // Update strike price for the new cycle
+            const bSymbol = marketToBinanceSymbol(market);
+            if (bSymbol && this.binanceWs) {
+                const spotPrice = this.binanceWs.getPrice(bSymbol);
+                if (spotPrice) {
+                    this.strikePrice.set(market, spotPrice);
+                    logger.info(`⚡ New strike price [${market}] cycle ${newSlug}: ${spotPrice}`);
+                }
+            }
+
+            // Clear HPAC one-shot flags from the previous cycle
+            const prevHpacKey = `${market}-${prevSlug}`;
+            this.hpacBoughtUp.delete(prevHpacKey);
+            this.hpacHedged.delete(prevHpacKey);
+            this.hpacLiquidatedCheapUp.delete(prevHpacKey);
+            this.hpacLiquidatedCheapDown.delete(prevHpacKey);
+            this.hpacRemainingLegPrevAsk.delete(prevHpacKey);
+
             const predictor = this.pricePredictors.get(market);
             if (predictor) {
                 predictor.reset();
@@ -539,14 +669,16 @@ export class UpDownPredictionBot {
         }
     }
 
+    /**
+     * GTC limit buy at the given price (caller sets passive vs aggressive).
+     * Phase 1 uses best bid; HPAC passes ask + spread when urgency matters.
+     */
     private async buyShares(
         leg: "YES" | "NO",
         tokenID: string,
-        askPrice: number,
+        limitPrice: number,
         size: number,
     ): Promise<boolean> {
-        const limitPrice = askPrice + 0.01;
-
         const limitOrder: UserOrder = {
             tokenID,
             side: Side.BUY,
@@ -556,14 +688,13 @@ export class UpDownPredictionBot {
 
         const orderAmount = limitPrice * size;
 
-        logger.info(`BUY: ${leg} ~${size} shares @ limit ${limitPrice.toFixed(4)} (${orderAmount.toFixed(2)} USDC)`);
+        logger.info(`BUY: ${leg} ~${size} shares @ GTC limit ${limitPrice.toFixed(4)} (${orderAmount.toFixed(2)} USDC)`);
 
-        // Place order IMMEDIATELY (await to ensure it's placed within 10ms)
         try {
             const response = await this.client.createAndPostOrder(
                 limitOrder,
                 { tickSize: this.cfg.tickSize, negRisk: this.cfg.negRisk },
-                OrderType.GTC // Good-Till-Cancel for limit orders
+                OrderType.GTC
             );
 
             const orderID = response?.orderID;
@@ -571,8 +702,7 @@ export class UpDownPredictionBot {
                 logger.error(`BUY failed for ${leg} - no orderID returned`);
                 return false;
             }
-            // Order placed successfully
-            logger.info(`✅ First-Side Order placed: ${leg} orderID ${orderID.substring(0, 10)}... @ ${limitPrice.toFixed(4)}`);
+            logger.info(`✅ Limit BUY placed: ${leg} orderID ${orderID.substring(0, 10)}... @ ${limitPrice.toFixed(4)}`);
             return true;
         } catch (e) {
             logger.error(`BUY failed for ${leg}: ${e instanceof Error ? e.message : String(e)}`);
@@ -581,9 +711,11 @@ export class UpDownPredictionBot {
     }
 
     /**
-     * Execute prediction-based trading strategy
-     * When prediction says UP → buy UP token, then at next prediction buy DOWN token
-     * When prediction says DOWN → buy DOWN token, then at next prediction buy UP token
+     * Phase 1: place **both** legs as GTC limit orders (maker-friendly, lower taker fees).
+     * First leg only if that side's **best ask > PHASE1_FIRST_LEG_MIN_ASK** (0.5).
+     * In **(30s, 60s]** remaining, if signal ask **> PHASE1_LEG2_SUPPRESS_MIN_ASK** (0.7), leg2 is skipped.
+     * First leg at **best bid** on the signal side (tick-floored); second at `0.98 - firstLegLimit`.
+     * Posted together via `Promise.all` when leg2 is used.
      */
     private executePredictionTrade(
         market: string,
@@ -591,7 +723,10 @@ export class UpDownPredictionBot {
         prediction: PricePrediction,
         upAsk: number,
         downAsk: number,
+        upBid: number,
+        downBid: number,
         tokenIds: { upTokenId: string; downTokenId: string; conditionId: string; upIdx: number; downIdx: number },
+        timeRemainingSeconds: number,
     ): void {
         // Initialize prediction score for this market/slug if not exists
         const scoreKey = `${market}-${slug}`;
@@ -639,22 +774,45 @@ export class UpDownPredictionBot {
         let tokenId = "";
 
         if (prediction.direction === "up") {
-            // Prediction says rising → buy UP token
             buyToken = "UP";
-            buyPrice = upAsk;
+            buyPrice = floorPriceToTick(upBid, String(this.cfg.tickSize));
             tokenId = tokenIds.upTokenId;
         } else if (prediction.direction === "down") {
-            // Prediction says falling → buy DOWN token
             buyToken = "DOWN";
-            buyPrice = downAsk;
+            buyPrice = floorPriceToTick(downBid, String(this.cfg.tickSize));
             tokenId = tokenIds.downTokenId;
         }
 
-        if (!buyToken) return; // No valid buy signal
+        if (!buyToken) {
+            score.totalPredictions--;
+            return;
+        }
+
+        if (buyPrice <= 0 || buyPrice >= 1) {
+            logger.error(`⚠️  Invalid passive first-leg limit ${buyPrice.toFixed(4)} — skip`);
+            score.totalPredictions--;
+            return;
+        }
+
+        const signalAsk = buyToken === "UP" ? upAsk : downAsk;
+        if (signalAsk <= PHASE1_FIRST_LEG_MIN_ASK) {
+            logger.info(
+                `⏭️  Phase1 skip first leg: ${buyToken} ask ${signalAsk.toFixed(4)} ≤ ${PHASE1_FIRST_LEG_MIN_ASK} ` +
+                `(need ask > ${PHASE1_FIRST_LEG_MIN_ASK})`
+            );
+            score.totalPredictions--;
+            return;
+        }
+
+        const suppressLeg2 =
+            timeRemainingSeconds > HPAC_WINDOW_SECONDS &&
+            timeRemainingSeconds <= PHASE1_LEG2_SUPPRESS_WINDOW_SEC &&
+            signalAsk > PHASE1_LEG2_SUPPRESS_MIN_ASK;
 
         // Check if market is paused (reached 50 UP + 50 DOWN)
         if (this.pausedMarkets.has(scoreKey)) {
-            return; // Skip silently - market paused
+            score.totalPredictions--;
+            return;
         }
 
         // Get or initialize token counts for this market
@@ -668,11 +826,13 @@ export class UpDownPredictionBot {
         // Use > instead of >= to prevent exceeding limit (if count is already at limit, don't place order)
         if (buyToken === "UP" && tokenCounts.upTokenCount >= this.MAX_BUY_COUNTS_PER_SIDE) {
             logger.info(`⛔ LIMIT REACHED: UP count is ${tokenCounts.upTokenCount}/${this.MAX_BUY_COUNTS_PER_SIDE} - skipping trade`);
-            return; // Skip - limit reached
+            score.totalPredictions--;
+            return;
         }
         if (buyToken === "DOWN" && tokenCounts.downTokenCount >= this.MAX_BUY_COUNTS_PER_SIDE) {
             logger.info(`⛔ LIMIT REACHED: DOWN count is ${tokenCounts.downTokenCount}/${this.MAX_BUY_COUNTS_PER_SIDE} - skipping trade`);
-            return; // Skip - limit reached
+            score.totalPredictions--;
+            return;
         }
 
         // Increment count for the side we're buying ONLY (before calling buySharesWithRetry to prevent race conditions)
@@ -686,27 +846,60 @@ export class UpDownPredictionBot {
 
         // Execute the buy
         const buyCost = buyPrice * this.cfg.sharesPerSide;
-        logger.info(`🎯 FIRST-SIDE Trade: ${buyToken} @ ${buyPrice.toFixed(4)} (${buyCost.toFixed(2)} USDC) | UP ${tokenCounts.upTokenCount}/${this.MAX_BUY_COUNTS_PER_SIDE}, DOWN ${tokenCounts.downTokenCount}/${this.MAX_BUY_COUNTS_PER_SIDE} | Limit: ${this.MAX_BUY_COUNTS_PER_SIDE} per side`);
-
-        this.buyShares(
-            buyToken === "UP" ? "YES" : "NO",
-            tokenId,
-            buyPrice,
-            this.cfg.sharesPerSide,
+        logger.info(
+            `🎯 PHASE1 ${suppressLeg2 ? "leg1 only" : "passive pair"}: ${buyToken} leg1 GTC @ bid ${buyPrice.toFixed(4)} ` +
+            `(ask ${signalAsk.toFixed(4)}) T≈${timeRemainingSeconds}s` +
+            (suppressLeg2
+                ? ` | leg2 suppressed (>${PHASE1_LEG2_SUPPRESS_MIN_ASK} in ${HPAC_WINDOW_SECONDS + 1}–${PHASE1_LEG2_SUPPRESS_WINDOW_SEC}s window)`
+                : "") +
+            ` | ${buyCost.toFixed(2)} USDC est | UP ${tokenCounts.upTokenCount}/${this.MAX_BUY_COUNTS_PER_SIDE}, ` +
+            `DOWN ${tokenCounts.downTokenCount}/${this.MAX_BUY_COUNTS_PER_SIDE}`
         );
 
-        // Place second-side limit order IMMEDIATELY (within 50ms) without waiting for first order response
-        // This ensures both orders are placed almost simultaneously for better execution
+        if (suppressLeg2) {
+            void this.buyShares(
+                buyToken === "UP" ? "YES" : "NO",
+                tokenId,
+                buyPrice,
+                this.cfg.sharesPerSide,
+            ).catch((e) => {
+                logger.error(`Phase1 leg1-only post failed: ${e instanceof Error ? e.message : String(e)}`);
+            });
+        } else {
+            const secondLimit = 0.98 - buyPrice;
+            if (secondLimit <= 0 || secondLimit >= 1) {
+                logger.error(`⚠️  Invalid second-leg limit ${secondLimit.toFixed(4)} — skip pair`);
+                if (buyToken === "UP") {
+                    tokenCounts.upTokenCount--;
+                    score.upTokenCount--;
+                } else {
+                    tokenCounts.downTokenCount--;
+                    score.downTokenCount--;
+                }
+                score.totalPredictions--;
+                return;
+            }
 
-        this.placeSecondSideLimitOrder(
-            buyToken,
-            buyPrice,
-            tokenIds,
-            market,
-            slug,
-            scoreKey,
-            tokenCounts
-        );
+            void Promise.all([
+                this.buyShares(
+                    buyToken === "UP" ? "YES" : "NO",
+                    tokenId,
+                    buyPrice,
+                    this.cfg.sharesPerSide,
+                ),
+                this.placeSecondSideLimitOrder(
+                    buyToken,
+                    buyPrice,
+                    tokenIds,
+                    market,
+                    slug,
+                    scoreKey,
+                    tokenCounts
+                ),
+            ]).catch((e) => {
+                logger.error(`Phase1 pair post failed: ${e instanceof Error ? e.message : String(e)}`);
+            });
+        }
 
         // Track the trade cost for the side we actually bought only
         if (buyToken === "UP") {
@@ -734,7 +927,7 @@ export class UpDownPredictionBot {
     }
 
     /**
-     * Place limit order for second side (opposite token) at price (0.99 - firstSidePrice)
+     * Second leg GTC limit at `0.98 - firstSideLimit` (firstSide = passive bid used for leg 1).
      */
     private async placeSecondSideLimitOrder(
         firstSide: "UP" | "DOWN",
@@ -968,6 +1161,272 @@ export class UpDownPredictionBot {
 
         // Remove from active tracking (summary generated)
         this.predictionScores.delete(scoreKey);
+    }
+
+    private getInventoryCounts(scoreKey: string): { upN: number; downN: number } {
+        const score = this.predictionScores.get(scoreKey);
+        const tc = this.tokenCountsByMarket.get(scoreKey);
+        return {
+            upN: score?.upTokenCount ?? tc?.upTokenCount ?? 0,
+            downN: score?.downTokenCount ?? tc?.downTokenCount ?? 0,
+        };
+    }
+
+    private applyFullExitUp(scoreKey: string): void {
+        const score = this.predictionScores.get(scoreKey);
+        if (score) {
+            score.upTokenCount = 0;
+            score.upTokenCost = 0;
+        }
+        const tc = this.tokenCountsByMarket.get(scoreKey);
+        if (tc) tc.upTokenCount = 0;
+    }
+
+    private applyFullExitDown(scoreKey: string): void {
+        const score = this.predictionScores.get(scoreKey);
+        if (score) {
+            score.downTokenCount = 0;
+            score.downTokenCost = 0;
+        }
+        const tc = this.tokenCountsByMarket.get(scoreKey);
+        if (tc) tc.downTokenCount = 0;
+    }
+
+    /** Aggressive exit: FOK market sell (amount = conditional shares). */
+    private async sellAllSharesMarketFOK(
+        tokenID: string,
+        totalShares: number,
+        label: string,
+    ): Promise<boolean> {
+        if (totalShares <= 0 || !Number.isFinite(totalShares)) return false;
+        try {
+            const res = (await this.client.createAndPostMarketOrder(
+                { tokenID, side: Side.SELL, amount: totalShares },
+                { tickSize: this.cfg.tickSize, negRisk: this.cfg.negRisk },
+                OrderType.FOK
+            )) as { success?: boolean; errorMsg?: string };
+            if (res && res.success === false) {
+                logger.error(`FOK sell ${label}: ${res.errorMsg ?? "rejected"}`);
+                return false;
+            }
+            logger.info(`✅ FOK sell ${label}: ${totalShares} shares`);
+            return true;
+        } catch (e) {
+            logger.error(`FOK sell ${label}: ${e instanceof Error ? e.message : String(e)}`);
+            return false;
+        }
+    }
+
+    /**
+     * Derive seconds remaining until settlement from the slug timestamp.
+     * Slug format: `{market}-updown-15m-{unixStartSeconds}`
+     */
+    private getTimeRemainingForSlug(slug: string): number {
+        const match = slug.match(/-updown-15m-(\d+)$/);
+        if (!match) return Infinity;
+        const startTs = parseInt(match[1], 10);
+        return (startTs + MARKET_DURATION_SECONDS) - Math.floor(Date.now() / 1000);
+    }
+
+    /**
+     * Phase 2 – High-Probability Auto-Compounding (HPAC).
+     *
+     * Triggered in the last 30 s of each 15-minute window.
+     * Uses a simplified Black-Scholes d2 model to estimate P(UP) from live
+     * Binance spot price, the cycle's strike price, and EWMA volatility.
+     *
+     * Decision rules (last 30s — no new first legs; second legs only):
+     *   1. Box locked in Phase 1 (avgUP + avgDOWN < 1)  → hold, do nothing.
+     *   2. Both legs held (not locked): if either leg’s ask ≤ EXPIRY_CHEAP_LEG_ASK_THRESHOLD,
+     *      FOK market-sell the entire position on that leg (see expiryStrategy.ts).
+     *   3. Single leg left: if best ask drops suddenly vs prior tick, compare BS outcome prob
+     *      to EXPIRY_REMAINING_HOLD_MIN_BS_PROB → SELL (FOK) or HOLD.
+     *   4. edge = P(UP) - mktPriceUP - FEES_BUFFER > 0.05 → market-buy UP **only if**
+     *      DOWN > UP (second leg only).
+     *   5. P(UP) < 0.10 AND UP > DOWN → hedge with DOWN (once).
+     *   Resting GTC second-side orders from Phase 1 may still fill on the exchange.
+     */
+    private async executeHPACPhase(
+        market: string,
+        slug: string,
+        upAsk: number,
+        downAsk: number,
+        tokenIds: { upTokenId: string; downTokenId: string; conditionId: string; upIdx: number; downIdx: number },
+        scoreKey: string,
+        timeRemaining: number,
+    ): Promise<void> {
+        if (this.hpacPhaseLocks.has(scoreKey)) return;
+        this.hpacPhaseLocks.add(scoreKey);
+        try {
+            let { upN, downN } = this.getInventoryCounts(scoreKey);
+            const score = this.predictionScores.get(scoreKey);
+
+            // Rule 1: profitable box already built in Phase 1 → hold to settlement
+            if (score && score.upTokenCount > 0 && score.downTokenCount > 0) {
+                const avgUpCost = score.upTokenCost / score.upTokenCount;
+                const avgDownCost = score.downTokenCost / score.downTokenCount;
+                if (avgUpCost + avgDownCost < 1.0) {
+                    logger.info(
+                        `🔒 HPAC [${market}] T=${timeRemaining.toFixed(1)}s: box locked ` +
+                        `(UP ${avgUpCost.toFixed(4)} + DOWN ${avgDownCost.toFixed(4)} = ` +
+                        `${(avgUpCost + avgDownCost).toFixed(4)}) – holding`
+                    );
+                    return;
+                }
+            }
+
+            // Cheap-leg dump: both legs, not locked (Rule 1 returned only when locked)
+            if (upN > 0 && downN > 0) {
+                this.hpacRemainingLegPrevAsk.delete(scoreKey);
+                const per = this.cfg.sharesPerSide;
+
+                if (upAsk <= EXPIRY_CHEAP_LEG_ASK_THRESHOLD && !this.hpacLiquidatedCheapUp.has(scoreKey)) {
+                    const shares = upN * per;
+                    const ok = await this.sellAllSharesMarketFOK(tokenIds.upTokenId, shares, `${market} UP cheap`);
+                    if (ok) {
+                        this.applyFullExitUp(scoreKey);
+                        this.hpacLiquidatedCheapUp.add(scoreKey);
+                        this.hpacRemainingLegPrevAsk.delete(scoreKey);
+                    }
+                }
+
+                ({ upN, downN } = this.getInventoryCounts(scoreKey));
+
+                if (downAsk <= EXPIRY_CHEAP_LEG_ASK_THRESHOLD && !this.hpacLiquidatedCheapDown.has(scoreKey)) {
+                    const shares = downN * per;
+                    const ok = await this.sellAllSharesMarketFOK(tokenIds.downTokenId, shares, `${market} DOWN cheap`);
+                    if (ok) {
+                        this.applyFullExitDown(scoreKey);
+                        this.hpacLiquidatedCheapDown.add(scoreKey);
+                        this.hpacRemainingLegPrevAsk.delete(scoreKey);
+                    }
+                }
+
+                ({ upN, downN } = this.getInventoryCounts(scoreKey));
+            }
+
+            const binanceSymbol = marketToBinanceSymbol(market);
+            const S = binanceSymbol ? this.binanceWs?.getPrice(binanceSymbol) : undefined;
+            const K = this.strikePrice.get(market);
+            const ewma = this.ewmaVolatility.get(market);
+            const bsOk = !!(binanceSymbol && S && K && ewma);
+
+            let pUp = 0.5;
+            let sigma = 0;
+            let edge = 0;
+            if (bsOk) {
+                sigma = ewma!.getAnnualizedVolatility();
+                pUp = computeUpProbability(S!, K!, timeRemaining, sigma);
+                edge = pUp - upAsk - FEES_BUFFER;
+                logger.info(
+                    `📐 HPAC [${market}] T=${timeRemaining.toFixed(1)}s ` +
+                    `S=${S!.toFixed(4)} K=${K!.toFixed(4)} σ=${sigma.toFixed(4)} ` +
+                    `P(UP)=${pUp.toFixed(4)} mkt=${upAsk.toFixed(4)} edge=${edge.toFixed(4)}`
+                );
+            } else {
+                logger.error(
+                    `⚠️  HPAC [${market}]: missing BS inputs (cheap-leg exits still allowed) ` +
+                    `sym=${binanceSymbol ?? "?"} S=${S ?? "?"} K=${K ?? "?"} ewma=${!!ewma}`
+                );
+            }
+
+            ({ upN, downN } = this.getInventoryCounts(scoreKey));
+
+            // Remaining leg: sudden ask drop + BS threshold → FOK sell or hold
+            if (bsOk && upN > 0 && downN === 0) {
+                const prev = this.hpacRemainingLegPrevAsk.get(scoreKey);
+                const sudden = detectSuddenAskDrop(upAsk, prev);
+                this.hpacRemainingLegPrevAsk.set(scoreKey, upAsk);
+                const decision = remainingLegBlackScholesSellOrHold("UP", pUp, sudden);
+                if (decision === "SELL") {
+                    const shares = upN * this.cfg.sharesPerSide;
+                    const ok = await this.sellAllSharesMarketFOK(tokenIds.upTokenId, shares, `${market} UP BS exit`);
+                    if (ok) this.applyFullExitUp(scoreKey);
+                } else if (sudden) {
+                    logger.info(
+                        `📌 HPAC [${market}] hold UP: sudden drop but P(UP)=${pUp.toFixed(4)} ≥ ` +
+                        `${EXPIRY_REMAINING_HOLD_MIN_BS_PROB} (min-hold)`
+                    );
+                }
+                ({ upN, downN } = this.getInventoryCounts(scoreKey));
+            } else if (bsOk && downN > 0 && upN === 0) {
+                const prev = this.hpacRemainingLegPrevAsk.get(scoreKey);
+                const sudden = detectSuddenAskDrop(downAsk, prev);
+                this.hpacRemainingLegPrevAsk.set(scoreKey, downAsk);
+                const decision = remainingLegBlackScholesSellOrHold("DOWN", pUp, sudden);
+                if (decision === "SELL") {
+                    const shares = downN * this.cfg.sharesPerSide;
+                    const ok = await this.sellAllSharesMarketFOK(tokenIds.downTokenId, shares, `${market} DOWN BS exit`);
+                    if (ok) this.applyFullExitDown(scoreKey);
+                } else if (sudden) {
+                    const pDn = 1 - pUp;
+                    logger.info(
+                        `📌 HPAC [${market}] hold DOWN: sudden drop but P(DOWN)=${pDn.toFixed(4)} ≥ ` +
+                        `${EXPIRY_REMAINING_HOLD_MIN_BS_PROB} (min-hold)`
+                    );
+                }
+                ({ upN, downN } = this.getInventoryCounts(scoreKey));
+            } else if (upN > 0 && downN > 0) {
+                this.hpacRemainingLegPrevAsk.delete(scoreKey);
+            }
+
+            // Rule 4: edge buy UP only as second leg
+            if (bsOk && edge > HPAC_EDGE_THRESHOLD && !this.hpacBoughtUp.has(scoreKey)) {
+                if (downN > upN) {
+                    this.hpacBoughtUp.add(scoreKey);
+                    logger.info(
+                        `⚡ HPAC BUY UP [${market}] (second leg): edge ${edge.toFixed(4)} > ${HPAC_EDGE_THRESHOLD} ` +
+                        `| UP ${upN} / DOWN ${downN}`
+                    );
+                    await this.buyShares("YES", tokenIds.upTokenId, upAsk + 0.01, this.cfg.sharesPerSide);
+                    return;
+                }
+                logger.info(
+                    `⏭️  HPAC [${market}]: skip edge BUY UP — first leg of new pair disallowed in last ${HPAC_WINDOW_SECONDS}s ` +
+                    `(UP ${upN}, DOWN ${downN}, edge ${edge.toFixed(4)})`
+                );
+            }
+
+            // Rule 5: hedge / second-leg DOWN only when net long UP
+            if (bsOk && pUp < 0.10 && upN > downN && !this.hpacHedged.has(scoreKey)) {
+                this.hpacHedged.add(scoreKey);
+                logger.info(
+                    `🛡️  HPAC HEDGE DOWN [${market}]: P(UP)=${pUp.toFixed(4)} < 0.10 ` +
+                    `| UP ${upN} > DOWN ${downN}`
+                );
+                await this.buyShares("NO", tokenIds.downTokenId, downAsk + 0.01, this.cfg.sharesPerSide);
+            }
+        } finally {
+            this.hpacPhaseLocks.delete(scoreKey);
+        }
+    }
+
+    /**
+     * Periodic scan – ensures HPAC fires even during quiet (no-price-update) periods
+     * in the final 30 seconds.
+     */
+    private async checkHPACAllMarkets(): Promise<void> {
+        if (this.isStopped) return;
+
+        for (const market of this.cfg.markets) {
+            const slug = this.getSlugForMarket(market);
+            if (!slug) continue;
+
+            const timeRemaining = this.getTimeRemainingForSlug(slug);
+            if (timeRemaining <= 0 || timeRemaining > HPAC_WINDOW_SECONDS) continue;
+
+            const tokenIds = this.tokenIdsByMarket[market];
+            if (!tokenIds || tokenIds.slug !== slug) continue;
+
+            const upPrice = this.wsOrderBook?.getPrice(tokenIds.upTokenId);
+            const downPrice = this.wsOrderBook?.getPrice(tokenIds.downTokenId);
+            if (!upPrice?.bestAsk || !downPrice?.bestAsk) continue;
+
+            await this.executeHPACPhase(
+                market, slug, upPrice.bestAsk, downPrice.bestAsk,
+                tokenIds, `${market}-${slug}`, timeRemaining
+            );
+        }
     }
 
     /**
